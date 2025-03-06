@@ -15,7 +15,7 @@ from pygame import mixer
 import os
 from gtts import gTTS
 import time
-import requests
+from http.client import HTTPSConnection
 import threading
 import ast
 from typing import Dict, Any, List, Tuple, Optional
@@ -126,7 +126,6 @@ class Config:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
     def _validate_and_update_on_startup(self):
-        # Проверка при запуске
         api_key = self.get_key()
         folder_id = self.get_folder_id()
         
@@ -136,7 +135,6 @@ class Config:
             self.update_folder_id("b1g170pkl3ihbn8bc3kd")
             return
             
-        # Проверка валидности существующих данных
         temp_gpt = YandexGPT(api_key, folder_id)
         available, status = temp_gpt.check_availability()
         
@@ -159,7 +157,6 @@ class Config:
         return ""
 
     def update_api_key(self, key_id: str, value: str) -> bool:
-        # Проверка валидности перед сохранением
         temp_gpt = YandexGPT(value, self.get_folder_id())
         available, status = temp_gpt.check_availability()
         
@@ -185,7 +182,6 @@ class Config:
             logging.error("Недействительный folder_id")
             return False
             
-        # Проверка с текущим ключом
         api_key = self.get_key()
         if api_key:
             temp_gpt = YandexGPT(api_key, folder_id)
@@ -315,9 +311,11 @@ class YandexGPT:
     def __init__(self, api_key: str, folder_id: str):
         self.api_key = api_key
         self.folder_id = folder_id
-        self.url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-        self.model = "yandexgpt-lite"
-        self.temperature = 0.6
+        self.url = "llm.api.cloud.yandex.net"
+        self.path = "/foundationModels/v1/completion"
+        self.model = "yandexgpt/latest"
+        self.temperature = 0.68
+        self.max_tokens = 500
         self.available = False
         self.status = "Не проверено"
         self._validate_credentials()
@@ -333,38 +331,78 @@ class YandexGPT:
 
     def check_availability(self) -> Tuple[bool, str]:
         try:
-            headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
+            conn = HTTPSConnection(self.url)
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
+            }
             payload = {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
-                "completionOptions": {"stream": False, "temperature": self.temperature, "maxTokens": 2000},
+                "completionOptions": {
+                    "maxTokens": self.max_tokens,
+                    "temperature": self.temperature
+                },
                 "messages": [{"role": "user", "text": "Test"}]
             }
-            response = requests.post(self.url, headers=headers, json=payload, timeout=5)
-            response.raise_for_status()
-            self.available = response.status_code == 200
-            self.status = "Доступно" if self.available else f"Ошибка: {response.status_code}"
-        except requests.RequestException as e:
+            conn.request("POST", self.path, body=json.dumps(payload), headers=headers)
+            response = conn.getresponse()
+            self.available = response.status == 200
+            self.status = "Доступно" if self.available else f"Ошибка: {response.status}"
+            conn.close()
+            return self.available, self.status
+        except Exception as e:
             self.available = False
             self.status = f"Ошибка сети: {str(e)}"
-        return self.available, self.status
+            return self.available, self.status
 
     def invoke(self, query: str = None, context: str = "", json_payload: Dict[str, Any] = None) -> str:
         if not self.available:
             return f"API отключен: {self.status}"
         if not query and not json_payload:
             return "Ошибка: Запрос пустой"
+        
         try:
-            headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
+            conn = HTTPSConnection(self.url)
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
+            }
+            
             payload = json_payload or {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
-                "completionOptions": {"stream": False, "temperature": self.temperature, "maxTokens": 2000},
-                "messages": [{"role": "user", "text": query if not context else f"{context}\n{query}"}]
+                "completionOptions": {
+                    "maxTokens": self.max_tokens,
+                    "temperature": self.temperature
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "text": "Ты креативный помощник, который придумывает названия и описания для новых продуктов. "
+                                "Твои ответы должны быть в формате JSON."
+                    },
+                    {
+                        "role": "user",
+                        "text": query if not context else f"{context}\n{query}"
+                    }
+                ]
             }
-            response = requests.post(self.url, headers=headers, json=payload, timeout=10)
-            response.raise_for_status()
-            result = response.json()
-            return result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
-        except requests.RequestException as e:
+            
+            conn.request("POST", self.path, body=json.dumps(payload), headers=headers)
+            response = conn.getresponse()
+            if response.status != 200:
+                conn.close()
+                return f"Ошибка: {response.status} {response.reason}"
+            
+            result = response.read().decode('utf-8')
+            conn.close()
+            
+            try:
+                json_result = json.loads(result)
+                return json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
+            except json.JSONDecodeError:
+                return result
+                
+        except Exception as e:
             logging.error(f"Ошибка Yandex GPT: {e}")
             return f"Ошибка сети: {str(e)}"
 
@@ -456,15 +494,18 @@ class KnowledgeBase:
 
     def save_web_content(self, url: str, query: str) -> bool:
         try:
-            response = requests.get(url, timeout=10)
+            conn = HTTPSConnection(url.split('/')[2])
+            conn.request("GET", '/' + '/'.join(url.split('/')[3:]))
+            response = conn.getresponse()
             response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.read(), 'html.parser')
             text = soup.get_text(separator=' ', strip=True)
+            conn.close()
             if text:
                 self.save(query, text, context=f"Извлечено с сайта: {url}")
                 return True
             return False
-        except requests.RequestException as e:
+        except Exception as e:
             logging.error(f"Ошибка извлечения с {url}: {e}")
             return False
 
@@ -489,7 +530,6 @@ class YandexAIServices:
         self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
         self.code_optimizer = CodeOptimizationModule(self.config)
         
-        # Проверка при инициализации
         available, status = self.gpt.check_availability()
         if not available:
             logging.warning(f"Инициализация с проблемой API: {status}")
