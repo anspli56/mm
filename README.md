@@ -75,14 +75,15 @@ class Config:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
                 cls._instance._load_config()
+                cls._instance._validate_and_update_on_startup()
             return cls._instance
 
     def _load_config(self):
         self.default_config = {
             "database": "nere_more_knowledge.json",
             "yandex": {
-                "keys": [{"id": "gpt_key_1", "value": "AQVNzTtblalTUXsirPCc44AUB4fWoisjVXuXrYuE", "type": "gpt"}],
-                "folder_id": "b1g170pkl3ihbn8bc3kd"
+                "keys": [{"id": "gpt_key_1", "value": "", "type": "gpt"}],
+                "folder_id": ""
             },
             "ui": {"animation_speed": 0.05, "max_context": 10, "audio_enabled": True},
             "learning": {"cluster_size": 5, "feedback_weight": 0.9},
@@ -124,6 +125,26 @@ class Config:
         except IOError as e:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
+    def _validate_and_update_on_startup(self):
+        # Проверка при запуске
+        api_key = self.get_key()
+        folder_id = self.get_folder_id()
+        
+        if not api_key or not folder_id:
+            logging.info("API ключ или folder_id отсутствуют, используются значения по умолчанию")
+            self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
+            self.update_folder_id("b1g170pkl3ihbn8bc3kd")
+            return
+            
+        # Проверка валидности существующих данных
+        temp_gpt = YandexGPT(api_key, folder_id)
+        available, status = temp_gpt.check_availability()
+        
+        if not available:
+            logging.warning(f"Сохраненные данные недействительны: {status}. Установка значений по умолчанию")
+            self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
+            self.update_folder_id("b1g170pkl3ihbn8bc3kd")
+
     @property
     def data(self) -> Dict[str, Any]:
         return self.config
@@ -137,25 +158,45 @@ class Config:
                     return key["value"]
         return ""
 
-    def update_api_key(self, key_id: str, value: str):
+    def update_api_key(self, key_id: str, value: str) -> bool:
+        # Проверка валидности перед сохранением
+        temp_gpt = YandexGPT(value, self.get_folder_id())
+        available, status = temp_gpt.check_availability()
+        
+        if not available:
+            logging.error(f"Новый API ключ недействителен: {status}")
+            return False
+            
         encrypted_value = self._cipher.encrypt(value.encode()).decode()
         for key in self.config["yandex"]["keys"]:
             if key["id"] == key_id:
                 key["value"] = encrypted_value
                 self._save_config()
-                return
+                return True
         self.config["yandex"]["keys"].append({"id": key_id, "value": encrypted_value, "type": "gpt"})
         self._save_config()
+        return True
 
     def get_folder_id(self) -> str:
         return self.config["yandex"].get("folder_id", "")
 
     def update_folder_id(self, folder_id: str) -> bool:
-        if validate_folder_id(folder_id):
-            self.config["yandex"]["folder_id"] = folder_id
-            self._save_config()
-            return True
-        return False
+        if not validate_folder_id(folder_id):
+            logging.error("Недействительный folder_id")
+            return False
+            
+        # Проверка с текущим ключом
+        api_key = self.get_key()
+        if api_key:
+            temp_gpt = YandexGPT(api_key, folder_id)
+            available, status = temp_gpt.check_availability()
+            if not available:
+                logging.error(f"folder_id недействителен с текущим ключом: {status}")
+                return False
+                
+        self.config["yandex"]["folder_id"] = folder_id
+        self._save_config()
+        return True
 
 class CodeOptimizationModule:
     def __init__(self, config: Config):
@@ -447,6 +488,13 @@ class YandexAIServices:
         self.knowledge = KnowledgeBase(self)
         self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
         self.code_optimizer = CodeOptimizationModule(self.config)
+        
+        # Проверка при инициализации
+        available, status = self.gpt.check_availability()
+        if not available:
+            logging.warning(f"Инициализация с проблемой API: {status}")
+            if gui_parent:
+                gui_parent.status_label.configure(text=f"Ошибка API: {status}")
 
     def _request_credentials_if_needed(self):
         if not validate_folder_id(self.config.get_folder_id()):
@@ -455,8 +503,8 @@ class YandexAIServices:
                 logging.info(f"Обновлен folder_id: {folder_id}")
         if not self.config.get_key():
             api_key = ctk.CTkInputDialog(text="Введите API-ключ:", title="API Key").get_input()
-            if api_key:
-                self.config.update_api_key("gpt_key_1", api_key)
+            if api_key and self.config.update_api_key("gpt_key_1", api_key):
+                logging.info("API ключ обновлен")
 
     def check_api_key(self) -> Tuple[bool, str]:
         return self.gpt.check_availability()
@@ -480,7 +528,6 @@ class YandexAIServices:
         return similar[0][1] if similar else self.gpt.invoke(query, context)
 
 class CodePasteWindow(ctk.CTkToplevel):
-    """Окно для вставки кода с изменяемым размером."""
     def __init__(self, parent, callback):
         super().__init__(parent)
         self.title("Вставка кода")
@@ -925,32 +972,26 @@ class APISettingsWindow(ctk.CTkToplevel):
         self._init_ui()
 
     def _init_ui(self):
-        # Поле для API ключа
         ctk.CTkLabel(self, text="YandexGPT key:").grid(row=0, column=0, padx=5, pady=5)
         self.key_entry = ctk.CTkEntry(self, width=150)
         self.key_entry.grid(row=0, column=1, padx=5, pady=5)
         self.key_entry.insert(0, self.config.get_key())
 
-        # Кнопка вставки
         ctk.CTkButton(self, text="📋 Вставить", command=self._paste_key,
                      width=80, fg_color="#1C2526", hover_color="#4A4A4A").grid(row=0, column=2, padx=5)
 
-        # Поле для Folder ID
         ctk.CTkLabel(self, text="Folder ID:").grid(row=1, column=0, padx=5, pady=5)
         self.folder_entry = ctk.CTkEntry(self, width=150)
         self.folder_entry.grid(row=1, column=1, padx=5, pady=5)
         self.folder_entry.insert(0, self.config.get_folder_id())
 
-        # Кнопка сохранения с авторизацией
         ctk.CTkButton(self, text="Сохранить", command=self._save_api_key,
                      fg_color="#1C2526", hover_color="#4A4A4A").grid(row=2, column=0, columnspan=3, pady=10)
 
-        # Статус
         self.status_label = ctk.CTkLabel(self, text="")
         self.status_label.grid(row=3, column=0, columnspan=3, pady=5)
 
     def _paste_key(self):
-        """Вставка текста из буфера обмена в поле API ключа"""
         try:
             clipboard_text = self.clipboard_get()
             if clipboard_text:
@@ -962,31 +1003,7 @@ class APISettingsWindow(ctk.CTkToplevel):
         except tk.TclError:
             self.status_label.configure(text="Ошибка доступа к буферу")
 
-    def _check_api_key(self, api_key: str, folder_id: str) -> Tuple[bool, str]:
-        """Проверка валидности API ключа через запрос к YandexGPT"""
-        try:
-            url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-            headers = {
-                "Authorization": f"Api-Key {api_key}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "modelUri": f"gpt://{folder_id}/yandexgpt-lite",
-                "completionOptions": {
-                    "stream": False,
-                    "temperature": 0.6,
-                    "maxTokens": 2000
-                },
-                "messages": [{"role": "user", "text": "Test"}]
-            }
-            response = requests.post(url, headers=headers, json=payload, timeout=5)
-            response.raise_for_status()
-            return True, "API ключ валиден"
-        except requests.RequestException as e:
-            return False, f"Ошибка авторизации: {str(e)}"
-
     def _save_api_key(self):
-        """Сохранение API ключа с предварительной проверкой"""
         key = self.key_entry.get().strip()
         folder_id = self.folder_entry.get().strip()
 
@@ -998,16 +1015,15 @@ class APISettingsWindow(ctk.CTkToplevel):
             self.status_label.configure(text="Ошибка: folder_id должен быть 20 символов (буквы/цифры)")
             return
 
-        # Проверка валидности API ключа
-        is_valid, status_message = self._check_api_key(key, folder_id)
+        temp_gpt = YandexGPT(key, folder_id)
+        is_valid, status_message = temp_gpt.check_availability()
         self.status_label.configure(text=status_message)
 
         if is_valid:
-            # Если ключ валиден, сохраняем его
             self.config.update_api_key("gpt_key_1", key)
             self.config.update_folder_id(folder_id)
             self.status_label.configure(text="Настройки сохранены")
-            self.after(1000, self.destroy)  # Закрытие через 1 секунду после сохранения
+            self.after(1000, self.destroy)
         else:
             self.status_label.configure(text=f"Ошибка: {status_message}")
 
