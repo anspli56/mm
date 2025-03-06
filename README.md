@@ -15,7 +15,6 @@ from pygame import mixer
 import os
 from gtts import gTTS
 import time
-from http.client import HTTPSConnection
 import threading
 import ast
 from typing import Dict, Any, List, Tuple, Optional
@@ -27,14 +26,6 @@ from tinydb import TinyDB, Query
 import joblib
 from cryptography.fernet import Fernet
 import black
-from pylint import lint
-from io import StringIO
-from pylint.reporters.text import TextReporter
-from PIL import Image, ImageGrab
-import pytesseract
-import importlib.util
-import sys
-import traceback
 import requests
 
 logging.basicConfig(
@@ -49,6 +40,15 @@ ctk.set_default_color_theme("dark-blue")
 def validate_folder_id(folder_id: str) -> bool:
     """Проверяет валидность folder_id."""
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
+
+def fibonacci(n: int) -> int:
+    """Вычисляет n-е число Фибоначчи для формирования 'готической' последовательности."""
+    if n <= 1:
+        return n
+    a, b = 0, 1
+    for _ in range(2, n + 1):
+        a, b = b, a + b
+    return b
 
 class AudioManager:
     def play_sound(self, text: str, filename: str) -> None:
@@ -90,7 +90,7 @@ class Config:
                 "folder_id": ""
             },
             "ui": {"animation_speed": 0.05, "max_context": 10, "audio_enabled": True},
-            "learning": {"cluster_size": 5, "feedback_weight": 0.9},
+            "learning": {"cluster_size": 5, "feedback_weight": 0.9, "learning_rate": 0.0},
             "code_classification": {
                 "purposes": ["algorithm", "UI", "data_processing", "network", "utility"],
                 "locations": ["core", "GUI", "services", "knowledge"],
@@ -238,22 +238,6 @@ class CodeOptimizationModule:
             ast.parse(code)
         except SyntaxError as e:
             errors.append(f"Синтаксическая ошибка: {str(e)}")
-        
-        try:
-            output = StringIO()
-            reporter = TextReporter(output)
-            args = ["--from-stdin", "--persistent=n", "--score=n"]
-            pylint_run = lint.Run(args, reporter=reporter, do_exit=False)
-            pylint_run.linter.check_single_file("stdin", code.splitlines())
-            pylint_output = output.getvalue()
-            output.close()
-            
-            for line in pylint_output.splitlines():
-                if "error" in line.lower() or "warning" in line.lower():
-                    errors.append(line.strip())
-        except Exception as e:
-            errors.append(f"Ошибка анализа Pylint: {str(e)}")
-        
         return errors if errors else ["Ошибок не обнаружено"]
 
     def analyze_structure(self, code: str) -> Dict[str, List[str]]:
@@ -279,11 +263,7 @@ class CodeOptimizationModule:
             return "\n".join(suggestions)
         
         for error in errors:
-            if "missing" in error.lower() and "docstring" in error.lower():
-                suggestions.append("Добавьте docstring для функций/классов.")
-            elif "undefined" in error.lower():
-                suggestions.append("Проверьте объявление переменных перед использованием.")
-            elif "syntax" in error.lower():
+            if "syntax" in error.lower():
                 suggestions.append("Исправьте синтаксическую ошибку (например, скобки, отступы).")
         
         return "\n".join(suggestions) if suggestions else "Структура корректна."
@@ -311,18 +291,6 @@ class CodeOptimizationModule:
                 integration_points.append((node.name, f"Интеграция класса {node.name} в {location}"))
         
         return integration_points
-
-    def analyze_from_screenshot(self, image_path: str) -> str:
-        """Анализирует код с изображения."""
-        try:
-            img = Image.open(image_path)
-            code = pytesseract.image_to_string(img)
-            if not code.strip():
-                return "Не удалось извлечь код из изображения"
-            return code
-        except Exception as e:
-            logging.error(f"Ошибка анализа скриншота: {e}")
-            return f"Ошибка: {str(e)}"
 
 class YandexGPT:
     def __init__(self, api_key: str, folder_id: str):
@@ -394,7 +362,7 @@ class YandexGPT:
                 "messages": [
                     {
                         "role": "system",
-                        "text": "Ты ассистент дроид, способный помочь в галактических приключениях."
+                        "text": "Ты ассистент дроид, способный помочь в галактических приключениях. Ты учишься с каждым вопросом, становясь всё более похожим на человека."
                     },
                     {
                         "role": "user",
@@ -425,6 +393,8 @@ class KnowledgeBase:
         self.embeddings_cache = OrderedDict(maxlen=1000)
         self.query_cache = OrderedDict(maxlen=1000)
         self.vectorizer_fitted = False
+        self.question_count = 0
+        self.learning_rate = 0.0
         self._load_state()
 
     def _load_state(self):
@@ -471,6 +441,15 @@ class KnowledgeBase:
             self.kmeans = MiniBatchKMeans(n_clusters=n_clusters)
             self._save_state()
 
+    def update_learning_rate(self) -> float:
+        """Обновляет процент обучения на основе числа Фибоначчи."""
+        self.question_count += 1
+        fib_value = fibonacci(self.question_count)
+        self.learning_rate = min(100.0, fib_value * 0.1)  # Ограничиваем 100%
+        self.config["learning"]["learning_rate"] = self.learning_rate
+        Config()._save_config()
+        return self.learning_rate
+
     def save(self, query: str, response: str, context: str = "", feedback: float = 0.0):
         """Сохраняет запрос и ответ в базу знаний."""
         with self._lock:
@@ -488,7 +467,8 @@ class KnowledgeBase:
                 'context': context,
                 'embeddings': embeddings.tobytes(),
                 'feedback': feedback,
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'learning_rate': self.update_learning_rate()
             }
             self.db.insert(entry)
 
@@ -531,6 +511,8 @@ class KnowledgeBase:
                 self.query_cache.clear()
                 self.vectorizer_fitted = False
                 self.kmeans = None
+                self.question_count = 0
+                self.learning_rate = 0.0
             self._save_state()
 
 class YandexAIServices:
@@ -563,12 +545,14 @@ class YandexAIServices:
         return self.gpt.check_availability()
 
     def generate_response(self, query: str, context: str = "") -> str:
-        """Генерирует ответ на запрос."""
+        """Генерирует ответ на запрос с учетом обучения."""
         if not query:
             return "Ошибка: Запрос пуст"
         urls = re.findall(r'https?://\S+', query)
         if urls:
-            return self.knowledge.save_web_content(urls[0], query) and f"Сохранено с {urls[0]}" or f"Ошибка с {urls[0]}"
+            success = self.knowledge.save_web_content(urls[0], query)
+            return f"Сохранено с {urls[0]}" if success else f"Ошибка с {urls[0]}"
+        
         if "код" in query.lower() or "code" in query.lower():
             try:
                 formatted_code = black.format_str(query, mode=black.FileMode())
@@ -578,38 +562,33 @@ class YandexAIServices:
                 return response
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
+        
         similar = self.knowledge.get_similar(query)
         if similar:
-            return similar[0][1]
+            response = similar[0][1]
+        else:
+            prompt = {
+                "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
+                "completionOptions": {
+                    "stream": False,
+                    "temperature": 0.6 - (self.knowledge.learning_rate / 200),  # Температура уменьшается с обучением
+                    "maxTokens": 2000
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "text": f"Ты ассистент дроид, обученный на {self.knowledge.learning_rate:.1f}%. Ты учишься с каждым вопросом, становясь всё более похожим на человека."
+                    },
+                    {
+                        "role": "user",
+                        "text": query if not context else f"{context}\n{query}"
+                    }
+                ]
+            }
+            response = self.gpt.invoke(json_payload=prompt)
         
-        # Пример интеграции вашего запроса
-        prompt = {
-            "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": 0.6,
-                "maxTokens": 2000
-            },
-            "messages": [
-                {
-                    "role": "system",
-                    "text": "Ты ассистент дроид, способный помочь в галактических приключениях."
-                },
-                {
-                    "role": "user",
-                    "text": "Привет, Дроид! Мне нужна твоя помощь, чтобы узнать больше о Силе. Как я могу научиться ее использовать?"
-                },
-                {
-                    "role": "assistant",
-                    "text": "Привет! Чтобы овладеть Силой, тебе нужно понять ее природу. Сила находится вокруг нас и соединяет всю галактику. Начнем с основ медитации."
-                },
-                {
-                    "role": "user",
-                    "text": query if not context else f"{context}\n{query}"
-                }
-            ]
-        }
-        return self.gpt.invoke(json_payload=prompt)
+        self.knowledge.save(query, response, context)
+        return f"{response}\n\n[Обучение ИИ: {self.knowledge.learning_rate:.1f}%]"
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
@@ -676,29 +655,21 @@ class CodeEditorWindow(ctk.CTkToplevel):
 
         self.formatted_label = ctk.CTkLabel(self.output_frame, text="Отформатированный код:", text_color="#FFFFFF")
         self.formatted_label.pack(pady=2)
-        self.formatted_output = tk.Text(self.output_frame, height=10, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
+        self.formatted_output = tk.Text(self.output_frame, height=15, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
         self.formatted_output.pack(fill="both", expand=True, pady=5)
 
         self.changes_label = ctk.CTkLabel(self.output_frame, text="Изменения и интеграция:", text_color="#FFFFFF")
         self.changes_label.pack(pady=2)
-        self.changes_output = tk.Text(self.output_frame, height=10, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
+        self.changes_output = tk.Text(self.output_frame, height=15, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
         self.changes_output.pack(fill="both", expand=True, pady=5)
-
-        self.terminal_label = ctk.CTkLabel(self.output_frame, text="Терминал:", text_color="#FFFFFF")
-        self.terminal_label.pack(pady=2)
-        self.terminal_output = ctk.CTkTextbox(self.output_frame, height=8, width=40, fg_color="#1C2526", text_color="#FFFFFF")
-        self.terminal_output.pack(fill="both", expand=True, pady=5)
-        self.terminal_output.insert("1.0", "Терминал готов\n")
 
         button_frame = ctk.CTkFrame(self.main_frame, fg_color="#2F3536")
         button_frame.pack(fill="x", pady=5)
         
         ctk.CTkButton(button_frame, text="Сохранить", command=self._save_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Проверить", command=self._inspect_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Запустить", command=self._run_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Применить", command=self._apply_to_app, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Дублировать", command=self._duplicate_structure, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Скриншот", command=self._take_screenshot, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Отмена", command=self.destroy, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
 
     def _configure_syntax_highlighting(self):
@@ -788,8 +759,7 @@ class CodeEditorWindow(ctk.CTkToplevel):
     def _inspect_code(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", "Ошибка: Код пустой\n")
+            messagebox.showwarning("Предупреждение", "Код пустой")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
@@ -807,50 +777,27 @@ class CodeEditorWindow(ctk.CTkToplevel):
             f"Точки интеграции:\n" + "\n".join([f"- {suggestion}" for _, suggestion in integration_points]) + "\n"
         )
         
-        self.terminal_output.delete("1.0", "end")
-        self.terminal_output.insert("1.0", inspection_text)
+        self.parent.display_response(inspection_text)
 
     def _save_code(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            messagebox.showwarning("Предупреждение", "Код пустой")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
         errors = self.services.code_optimizer.detect_errors(code)
         formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
 
-        temp_module = f"temp_module_{uuid.uuid4().hex[:8]}"
-        with open(f"{temp_module}.py", "w", encoding="utf-8") as f:
-            f.write(formatted_code)
-
         code_id = uuid.uuid4().hex[:8]
         self.services.knowledge.save(f"Modified code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
         
         self.parent.display_response(f"Код сохранен (ID: {code_id}):\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors))
 
-    def _run_code(self):
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
-            return
-
-        sandbox_globals = {}
-        self.terminal_output.delete("1.0", "end")
-        try:
-            exec(code, sandbox_globals)
-            self.terminal_output.insert("1.0", "Код успешно выполнен в песочнице")
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            self.terminal_output.insert("1.0", f"Ошибка выполнения:\n{stack_trace}")
-
     def _apply_to_app(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            messagebox.showwarning("Предупреждение", "Код пустой")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
@@ -875,24 +822,13 @@ class CodeEditorWindow(ctk.CTkToplevel):
     def _duplicate_structure(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            messagebox.showwarning("Предупреждение", "Код пустой")
             return
         
         duplicated_code = self.services.code_optimizer.duplicate_structure(code)
         self.code_entry.delete("1.0", "end")
         self.code_entry.insert("1.0", duplicated_code)
         self._update_output()
-
-    def _take_screenshot(self):
-        try:
-            screenshot = ImageGrab.grab(bbox=(self.winfo_x(), self.winfo_y(), self.winfo_x() + self.winfo_width(), self.winfo_y() + self.winfo_height()))
-            filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
-            screenshot.save(filename)
-            self.terminal_output.delete("1.0", "end")
-            self.terminal_output.insert("1.0", f"Скриншот сохранен как {filename}")
-        except Exception as e:
-            self.terminal_output.insert("1.0", f"Ошибка создания скриншота: {e}")
 
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
@@ -960,7 +896,7 @@ class NereMoreInterface(ctk.CTk):
 
             self.protocol("WM_DELETE_WINDOW", self._on_closing)
             self.initialized = True
-            self.status_label.configure(text="Готов")
+            self.status_label.configure(text=f"Готов [Обучение ИИ: {self.services.knowledge.learning_rate:.1f}%]")
         except Exception as e:
             logging.error(f"Критическая ошибка инициализации: {e}", exc_info=True)
             messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение: {e}")
@@ -980,6 +916,7 @@ class NereMoreInterface(ctk.CTk):
             self.results_text.insert("1.0", json.dumps(json_response, ensure_ascii=False, indent=2))
         except json.JSONDecodeError:
             self.results_text.insert("1.0", text)
+        self.status_label.configure(text=f"Готов [Обучение ИИ: {self.services.knowledge.learning_rate:.1f}%]")
 
     def process_input(self):
         query = self.input_entry.get().strip()
@@ -1015,7 +952,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        self.display_response("Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Анализ скриншотов\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода")
+        self.display_response(f"Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода\n\nТекущий уровень обучения: {self.services.knowledge.learning_rate:.1f}%")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
