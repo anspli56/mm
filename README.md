@@ -35,6 +35,7 @@ import pytesseract
 import importlib.util
 import sys
 import traceback
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,10 +47,12 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 def validate_folder_id(folder_id: str) -> bool:
+    """Проверяет валидность folder_id."""
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
 
 class AudioManager:
     def play_sound(self, text: str, filename: str) -> None:
+        """Воспроизводит текст как аудио на русском языке."""
         try:
             tts = gTTS(text, lang="ru")
             tts.save(filename)
@@ -79,6 +82,7 @@ class Config:
             return cls._instance
 
     def _load_config(self):
+        """Загружает конфигурацию из файла или создает новую."""
         self.default_config = {
             "database": "nere_more_knowledge.json",
             "yandex": {
@@ -119,6 +123,7 @@ class Config:
             self._save_config()
 
     def _save_config(self):
+        """Сохраняет конфигурацию в файл."""
         try:
             with open("nere_more_config.json", "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=4)
@@ -126,6 +131,7 @@ class Config:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
     def _validate_and_update_on_startup(self):
+        """Проверяет и обновляет конфигурацию при запуске."""
         api_key = self.get_key()
         folder_id = self.get_folder_id()
         
@@ -148,6 +154,7 @@ class Config:
         return self.config
 
     def get_key(self) -> str:
+        """Возвращает расшифрованный API ключ."""
         for key in self.config["yandex"]["keys"]:
             if key["type"] == "gpt":
                 try:
@@ -157,6 +164,7 @@ class Config:
         return ""
 
     def update_api_key(self, key_id: str, value: str) -> bool:
+        """Обновляет API ключ после проверки."""
         temp_gpt = YandexGPT(value, self.get_folder_id())
         available, status = temp_gpt.check_availability()
         
@@ -175,9 +183,11 @@ class Config:
         return True
 
     def get_folder_id(self) -> str:
+        """Возвращает folder_id."""
         return self.config["yandex"].get("folder_id", "")
 
     def update_folder_id(self, folder_id: str) -> bool:
+        """Обновляет folder_id после проверки."""
         if not validate_folder_id(folder_id):
             logging.error("Недействительный folder_id")
             return False
@@ -199,6 +209,7 @@ class CodeOptimizationModule:
         self.config = config.data["code_classification"]
 
     def classify_code(self, code: str) -> Tuple[str, str]:
+        """Классифицирует код по назначению и местоположению."""
         purpose_score = {p: 0 for p in self.config["purposes"]}
         tokens = re.findall(r'\w+', code.lower())
         
@@ -221,6 +232,7 @@ class CodeOptimizationModule:
         return purpose, location
 
     def detect_errors(self, code: str) -> List[str]:
+        """Обнаруживает ошибки в коде."""
         errors = []
         try:
             ast.parse(code)
@@ -245,6 +257,7 @@ class CodeOptimizationModule:
         return errors if errors else ["Ошибок не обнаружено"]
 
     def analyze_structure(self, code: str) -> Dict[str, List[str]]:
+        """Анализирует структуру кода."""
         tree = ast.parse(code)
         structure = {"functions": [], "classes": []}
         
@@ -257,6 +270,7 @@ class CodeOptimizationModule:
         return structure
 
     def suggest_structure(self, code: str, errors: List[str]) -> str:
+        """Предлагает улучшения структуры кода."""
         suggestions = []
         try:
             tree = ast.parse(code, mode='exec', type_comments=True)
@@ -275,6 +289,7 @@ class CodeOptimizationModule:
         return "\n".join(suggestions) if suggestions else "Структура корректна."
 
     def duplicate_structure(self, code: str) -> str:
+        """Дублирует структуру кода."""
         tree = ast.parse(code)
         duplicated_code = []
         
@@ -285,6 +300,7 @@ class CodeOptimizationModule:
         return "\n\n".join(duplicated_code) if duplicated_code else code
 
     def suggest_integration_points(self, code: str, location: str) -> List[Tuple[str, str]]:
+        """Предлагает точки интеграции для кода."""
         integration_points = []
         tree = ast.parse(code)
         
@@ -297,6 +313,7 @@ class CodeOptimizationModule:
         return integration_points
 
     def analyze_from_screenshot(self, image_path: str) -> str:
+        """Анализирует код с изображения."""
         try:
             img = Image.open(image_path)
             code = pytesseract.image_to_string(img)
@@ -309,18 +326,19 @@ class CodeOptimizationModule:
 
 class YandexGPT:
     def __init__(self, api_key: str, folder_id: str):
+        """Инициализирует YandexGPT с API ключом и folder_id."""
         self.api_key = api_key
         self.folder_id = folder_id
-        self.url = "llm.api.cloud.yandex.net"
-        self.path = "/foundationModels/v1/completion"
-        self.model = "yandexgpt/latest"
-        self.temperature = 0.68
-        self.max_tokens = 500
+        self.url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+        self.model = "yandexgpt-lite"
+        self.temperature = 0.6
+        self.max_tokens = 2000
         self.available = False
         self.status = "Не проверено"
         self._validate_credentials()
 
     def _validate_credentials(self):
+        """Проверяет валидность учетных данных."""
         if not self.api_key or len(self.api_key.strip()) < 10:
             self.status = "Ошибка: API-ключ пустой или слишком короткий"
             return
@@ -330,11 +348,11 @@ class YandexGPT:
         self.check_availability()
 
     def check_availability(self) -> Tuple[bool, str]:
+        """Проверяет доступность API."""
         try:
-            conn = HTTPSConnection(self.url)
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
+                "Authorization": f"Api-Key {self.api_key}"
             }
             payload = {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
@@ -344,11 +362,9 @@ class YandexGPT:
                 },
                 "messages": [{"role": "user", "text": "Test"}]
             }
-            conn.request("POST", self.path, body=json.dumps(payload), headers=headers)
-            response = conn.getresponse()
-            self.available = response.status == 200
-            self.status = "Доступно" if self.available else f"Ошибка: {response.status}"
-            conn.close()
+            response = requests.post(self.url, headers=headers, json=payload)
+            self.available = response.status_code == 200
+            self.status = "Доступно" if self.available else f"Ошибка: {response.status_code}"
             return self.available, self.status
         except Exception as e:
             self.available = False
@@ -356,29 +372,29 @@ class YandexGPT:
             return self.available, self.status
 
     def invoke(self, query: str = None, context: str = "", json_payload: Dict[str, Any] = None) -> str:
+        """Выполняет запрос к YandexGPT."""
         if not self.available:
             return f"API отключен: {self.status}"
         if not query and not json_payload:
             return "Ошибка: Запрос пустой"
         
         try:
-            conn = HTTPSConnection(self.url)
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
+                "Authorization": f"Api-Key {self.api_key}"
             }
             
             payload = json_payload or {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
                 "completionOptions": {
+                    "stream": False,
                     "maxTokens": self.max_tokens,
                     "temperature": self.temperature
                 },
                 "messages": [
                     {
                         "role": "system",
-                        "text": "Ты креативный помощник, который придумывает названия и описания для новых продуктов. "
-                                "Твои ответы должны быть в формате JSON."
+                        "text": "Ты ассистент дроид, способный помочь в галактических приключениях."
                     },
                     {
                         "role": "user",
@@ -387,20 +403,12 @@ class YandexGPT:
                 ]
             }
             
-            conn.request("POST", self.path, body=json.dumps(payload), headers=headers)
-            response = conn.getresponse()
-            if response.status != 200:
-                conn.close()
-                return f"Ошибка: {response.status} {response.reason}"
+            response = requests.post(self.url, headers=headers, json=payload)
+            if response.status_code != 200:
+                return f"Ошибка: {response.status_code} {response.reason}"
             
-            result = response.read().decode('utf-8')
-            conn.close()
-            
-            try:
-                json_result = json.loads(result)
-                return json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
-            except json.JSONDecodeError:
-                return result
+            result = response.json()
+            return result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
                 
         except Exception as e:
             logging.error(f"Ошибка Yandex GPT: {e}")
@@ -420,6 +428,7 @@ class KnowledgeBase:
         self._load_state()
 
     def _load_state(self):
+        """Загружает состояние векторайзера и кластеризации."""
         try:
             if os.path.exists("vectorizer.pkl") and os.path.exists("kmeans.pkl"):
                 self.vectorizer = joblib.load("vectorizer.pkl")
@@ -442,6 +451,7 @@ class KnowledgeBase:
             self.vectorizer_fitted = False
 
     def _save_state(self):
+        """Сохраняет состояние моделей."""
         if self.vectorizer_fitted:
             try:
                 joblib.dump(self.vectorizer, "vectorizer.pkl")
@@ -450,6 +460,7 @@ class KnowledgeBase:
                 logging.error(f"Ошибка сохранения моделей: {e}")
 
     def _ensure_vectorizer_fitted(self, text: str):
+        """Обеспечивает обучение векторайзера."""
         if not self.vectorizer_fitted:
             docs = [entry['response'] for entry in self.db.all() if 'response' in entry]
             if not docs:
@@ -461,6 +472,7 @@ class KnowledgeBase:
             self._save_state()
 
     def save(self, query: str, response: str, context: str = "", feedback: float = 0.0):
+        """Сохраняет запрос и ответ в базу знаний."""
         with self._lock:
             if len(response.strip()) < 5:
                 return
@@ -481,6 +493,7 @@ class KnowledgeBase:
             self.db.insert(entry)
 
     def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
+        """Возвращает похожие записи из базы знаний."""
         self._ensure_vectorizer_fitted(query)
         query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
         all_data = [(entry['query'], entry['response'], np.frombuffer(entry['embeddings'], dtype=np.float16))
@@ -493,14 +506,12 @@ class KnowledgeBase:
         return [(q, r, float(s)) for (q, r, _), s in results]
 
     def save_web_content(self, url: str, query: str) -> bool:
+        """Сохраняет контент с веб-страницы."""
         try:
-            conn = HTTPSConnection(url.split('/')[2])
-            conn.request("GET", '/' + '/'.join(url.split('/')[3:]))
-            response = conn.getresponse()
+            response = requests.get(url)
             response.raise_for_status()
-            soup = BeautifulSoup(response.read(), 'html.parser')
+            soup = BeautifulSoup(response.text, 'html.parser')
             text = soup.get_text(separator=' ', strip=True)
-            conn.close()
             if text:
                 self.save(query, text, context=f"Извлечено с сайта: {url}")
                 return True
@@ -510,6 +521,7 @@ class KnowledgeBase:
             return False
 
     def _clear_cache(self, text_id: str = None):
+        """Очищает кэш базы знаний."""
         with self._lock:
             if text_id:
                 self.db.remove(Query().query.matches(f".*ID: {text_id}.*"))
@@ -537,6 +549,7 @@ class YandexAIServices:
                 gui_parent.status_label.configure(text=f"Ошибка API: {status}")
 
     def _request_credentials_if_needed(self):
+        """Запрашивает учетные данные, если они отсутствуют."""
         if not validate_folder_id(self.config.get_folder_id()):
             folder_id = ctk.CTkInputDialog(text="Введите folder_id (20 символов):", title="Folder ID").get_input()
             if folder_id and self.config.update_folder_id(folder_id):
@@ -550,6 +563,7 @@ class YandexAIServices:
         return self.gpt.check_availability()
 
     def generate_response(self, query: str, context: str = "") -> str:
+        """Генерирует ответ на запрос."""
         if not query:
             return "Ошибка: Запрос пуст"
         urls = re.findall(r'https?://\S+', query)
@@ -565,7 +579,37 @@ class YandexAIServices:
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
         similar = self.knowledge.get_similar(query)
-        return similar[0][1] if similar else self.gpt.invoke(query, context)
+        if similar:
+            return similar[0][1]
+        
+        # Пример интеграции вашего запроса
+        prompt = {
+            "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
+            "completionOptions": {
+                "stream": False,
+                "temperature": 0.6,
+                "maxTokens": 2000
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "text": "Ты ассистент дроид, способный помочь в галактических приключениях."
+                },
+                {
+                    "role": "user",
+                    "text": "Привет, Дроид! Мне нужна твоя помощь, чтобы узнать больше о Силе. Как я могу научиться ее использовать?"
+                },
+                {
+                    "role": "assistant",
+                    "text": "Привет! Чтобы овладеть Силой, тебе нужно понять ее природу. Сила находится вокруг нас и соединяет всю галактику. Начнем с основ медитации."
+                },
+                {
+                    "role": "user",
+                    "text": query if not context else f"{context}\n{query}"
+                }
+            ]
+        }
+        return self.gpt.invoke(json_payload=prompt)
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
@@ -964,26 +1008,6 @@ class NereMoreInterface(ctk.CTk):
             self.services.knowledge.save(f"Inserted text (ID: {uuid.uuid4().hex[:8]})", content)
             self.display_response(f"Вставлено: {content[:100]}...")
 
-    def _paste_text(self):
-        CodePasteWindow(self, self._paste_text_callback)
-
-    def _read_docx(self, file_path: str) -> str:
-        try:
-            doc = Document(file_path)
-            return "\n".join(para.text for para in doc.paragraphs)
-        except Exception as e:
-            logging.error(f"Ошибка чтения .docx: {e}")
-            return ""
-
-    def _read_xlsx(self, file_path: str) -> str:
-        try:
-            workbook = openpyxl.load_workbook(file_path)
-            sheet = workbook.active
-            return "\n".join("\t".join(str(cell or "") for cell in row) for row in sheet.iter_rows(values_only=True))
-        except Exception as e:
-            logging.error(f"Ошибка чтения .xlsx: {e}")
-            return ""
-
     def _magnet_search(self):
         query = self.input_entry.get().strip()
         if query:
@@ -1064,8 +1088,6 @@ class APISettingsWindow(ctk.CTkToplevel):
             self.config.update_folder_id(folder_id)
             self.status_label.configure(text="Настройки сохранены")
             self.after(1000, self.destroy)
-        else:
-            self.status_label.configure(text=f"Ошибка: {status_message}")
 
 class APIKeyCheckWindow(ctk.CTkToplevel):
     def __init__(self, parent, services, config):
