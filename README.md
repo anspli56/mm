@@ -42,7 +42,7 @@ def validate_folder_id(folder_id: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
 
 def fibonacci(n: int) -> int:
-    """Вычисляет n-е число Фибоначчи для формирования 'готической' последовательности."""
+    """Вычисляет n-е число Фибоначчи для формирования последовательности опыта."""
     if n <= 1:
         return n
     a, b = 0, 1
@@ -339,12 +339,10 @@ class YandexGPT:
             self.status = f"Ошибка сети: {str(e)}"
             return self.available, self.status
 
-    def invoke(self, query: str = None, context: str = "", json_payload: Dict[str, Any] = None) -> str:
+    def invoke(self, json_payload: Dict[str, Any]) -> str:
         """Выполняет запрос к YandexGPT."""
         if not self.available:
             return f"API отключен: {self.status}"
-        if not query and not json_payload:
-            return "Ошибка: Запрос пустой"
         
         try:
             headers = {
@@ -352,26 +350,7 @@ class YandexGPT:
                 "Authorization": f"Api-Key {self.api_key}"
             }
             
-            payload = json_payload or {
-                "modelUri": f"gpt://{self.folder_id}/{self.model}",
-                "completionOptions": {
-                    "stream": False,
-                    "maxTokens": self.max_tokens,
-                    "temperature": self.temperature
-                },
-                "messages": [
-                    {
-                        "role": "system",
-                        "text": "Ты ассистент дроид, способный помочь в галактических приключениях. Ты учишься с каждым вопросом, становясь всё более похожим на человека."
-                    },
-                    {
-                        "role": "user",
-                        "text": query if not context else f"{context}\n{query}"
-                    }
-                ]
-            }
-            
-            response = requests.post(self.url, headers=headers, json=payload)
+            response = requests.post(self.url, headers=headers, json=json_payload)
             if response.status_code != 200:
                 return f"Ошибка: {response.status_code} {response.reason}"
             
@@ -393,8 +372,9 @@ class KnowledgeBase:
         self.embeddings_cache = OrderedDict(maxlen=1000)
         self.query_cache = OrderedDict(maxlen=1000)
         self.vectorizer_fitted = False
-        self.question_count = 0
+        self.experience_level = 0
         self.learning_rate = 0.0
+        self.context_history = deque(maxlen=50)  # Хранит историю для логической последовательности
         self._load_state()
 
     def _load_state(self):
@@ -416,6 +396,8 @@ class KnowledgeBase:
                     if embeddings:
                         self.kmeans.fit(np.stack(embeddings))
                     self._save_state()
+            self.experience_level = len(self.db.all())
+            self.learning_rate = self.config["learning"]["learning_rate"]
         except Exception as e:
             logging.error(f"Ошибка загрузки состояния: {e}")
             self.vectorizer_fitted = False
@@ -441,17 +423,17 @@ class KnowledgeBase:
             self.kmeans = MiniBatchKMeans(n_clusters=n_clusters)
             self._save_state()
 
-    def update_learning_rate(self) -> float:
-        """Обновляет процент обучения на основе числа Фибоначчи."""
-        self.question_count += 1
-        fib_value = fibonacci(self.question_count)
-        self.learning_rate = min(100.0, fib_value * 0.1)  # Ограничиваем 100%
+    def update_experience(self) -> float:
+        """Обновляет уровень опыта и процент обучения на основе числа записей."""
+        self.experience_level += 1
+        fib_value = fibonacci(min(self.experience_level, 20))  # Ограничиваем рост для реалистичности
+        self.learning_rate = min(100.0, fib_value * 0.5)  # Увеличиваем медленнее, до 100%
         self.config["learning"]["learning_rate"] = self.learning_rate
         Config()._save_config()
         return self.learning_rate
 
     def save(self, query: str, response: str, context: str = "", feedback: float = 0.0):
-        """Сохраняет запрос и ответ в базу знаний."""
+        """Сохраняет запрос и ответ в базу знаний, обновляя опыт."""
         with self._lock:
             if len(response.strip()) < 5:
                 return
@@ -468,9 +450,10 @@ class KnowledgeBase:
                 'embeddings': embeddings.tobytes(),
                 'feedback': feedback,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'learning_rate': self.update_learning_rate()
+                'learning_rate': self.update_experience()
             }
             self.db.insert(entry)
+            self.context_history.append(f"Вопрос: {query}\nОтвет: {response}")
 
     def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
         """Возвращает похожие записи из базы знаний."""
@@ -486,9 +469,9 @@ class KnowledgeBase:
         return [(q, r, float(s)) for (q, r, _), s in results]
 
     def save_web_content(self, url: str, query: str) -> bool:
-        """Сохраняет контент с веб-страницы."""
+        """Сохраняет контент с веб-страницы и обновляет опыт."""
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             text = soup.get_text(separator=' ', strip=True)
@@ -500,6 +483,15 @@ class KnowledgeBase:
             logging.error(f"Ошибка извлечения с {url}: {e}")
             return False
 
+    def build_context(self, query: str) -> str:
+        """Формирует контекст на основе накопленного опыта."""
+        similar = self.get_similar(query, top_n=3)
+        context = "\n\n".join([f"Ранее: {q}\nОтвет: {r} (сходство: {s:.2f})" for q, r, s in similar])
+        if not context:
+            context = "У меня пока мало опыта по этому вопросу, но я постараюсь ответить на основе доступных данных."
+        history = "\n".join(list(self.context_history)[-5:])  # Последние 5 записей для последовательности
+        return f"История взаимодействия:\n{history}\n\nПрошлый опыт:\n{context}"
+
     def _clear_cache(self, text_id: str = None):
         """Очищает кэш базы знаний."""
         with self._lock:
@@ -509,9 +501,10 @@ class KnowledgeBase:
                 self.db.truncate()
                 self.embeddings_cache.clear()
                 self.query_cache.clear()
+                self.context_history.clear()
                 self.vectorizer_fitted = False
                 self.kmeans = None
-                self.question_count = 0
+                self.experience_level = 0
                 self.learning_rate = 0.0
             self._save_state()
 
@@ -545,50 +538,51 @@ class YandexAIServices:
         return self.gpt.check_availability()
 
     def generate_response(self, query: str, context: str = "") -> str:
-        """Генерирует ответ на запрос с учетом обучения."""
+        """Генерирует ответ на основе опыта и интернет-ресурсов."""
         if not query:
             return "Ошибка: Запрос пуст"
+        
+        # Обработка URL
         urls = re.findall(r'https?://\S+', query)
         if urls:
             success = self.knowledge.save_web_content(urls[0], query)
-            return f"Сохранено с {urls[0]}" if success else f"Ошибка с {urls[0]}"
+            return f"Сохранено с {urls[0]}\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]" if success else f"Ошибка с {urls[0]}"
         
+        # Обработка кода
         if "код" in query.lower() or "code" in query.lower():
             try:
                 formatted_code = black.format_str(query, mode=black.FileMode())
                 purpose, location = self.code_optimizer.classify_code(query)
                 errors = self.code_optimizer.detect_errors(query)
                 response = f"Отформатированный код:\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors)
-                return response
+                self.knowledge.save(query, response)
+                return f"{response}\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
         
-        similar = self.knowledge.get_similar(query)
-        if similar:
-            response = similar[0][1]
-        else:
-            prompt = {
-                "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
-                "completionOptions": {
-                    "stream": False,
-                    "temperature": 0.6 - (self.knowledge.learning_rate / 200),  # Температура уменьшается с обучением
-                    "maxTokens": 2000
+        # Формирование ответа на основе опыта
+        built_context = self.knowledge.build_context(query)
+        prompt = {
+            "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
+            "completionOptions": {
+                "stream": False,
+                "temperature": max(0.3, 0.6 - (self.knowledge.learning_rate / 200)),  # Температура снижается с опытом
+                "maxTokens": 2000
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "text": f"Ты ассистент, который учится на основе опыта (текущий уровень: {self.knowledge.learning_rate:.1f}%). Используй накопленные знания для логически последовательных ответов."
                 },
-                "messages": [
-                    {
-                        "role": "system",
-                        "text": f"Ты ассистент дроид, обученный на {self.knowledge.learning_rate:.1f}%. Ты учишься с каждым вопросом, становясь всё более похожим на человека."
-                    },
-                    {
-                        "role": "user",
-                        "text": query if not context else f"{context}\n{query}"
-                    }
-                ]
-            }
-            response = self.gpt.invoke(json_payload=prompt)
-        
-        self.knowledge.save(query, response, context)
-        return f"{response}\n\n[Обучение ИИ: {self.knowledge.learning_rate:.1f}%]"
+                {
+                    "role": "user",
+                    "text": f"Контекст:\n{built_context}\n\nТекущий запрос: {query}"
+                }
+            ]
+        }
+        response = self.gpt.invoke(prompt)
+        self.knowledge.save(query, response, context=built_context)
+        return f"{response}\n\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
@@ -896,7 +890,7 @@ class NereMoreInterface(ctk.CTk):
 
             self.protocol("WM_DELETE_WINDOW", self._on_closing)
             self.initialized = True
-            self.status_label.configure(text=f"Готов [Обучение ИИ: {self.services.knowledge.learning_rate:.1f}%]")
+            self.status_label.configure(text=f"Готов [Опыт ИИ: {self.services.knowledge.learning_rate:.1f}%]")
         except Exception as e:
             logging.error(f"Критическая ошибка инициализации: {e}", exc_info=True)
             messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение: {e}")
@@ -916,7 +910,7 @@ class NereMoreInterface(ctk.CTk):
             self.results_text.insert("1.0", json.dumps(json_response, ensure_ascii=False, indent=2))
         except json.JSONDecodeError:
             self.results_text.insert("1.0", text)
-        self.status_label.configure(text=f"Готов [Обучение ИИ: {self.services.knowledge.learning_rate:.1f}%]")
+        self.status_label.configure(text=f"Готов [Опыт ИИ: {self.services.knowledge.learning_rate:.1f}%]")
 
     def process_input(self):
         query = self.input_entry.get().strip()
@@ -952,7 +946,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        self.display_response(f"Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода\n\nТекущий уровень обучения: {self.services.knowledge.learning_rate:.1f}%")
+        self.display_response(f"Умения:\n- Генерация текста на основе опыта\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
