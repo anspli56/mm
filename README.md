@@ -27,6 +27,11 @@ import joblib
 from cryptography.fernet import Fernet
 import black
 import requests
+import importlib.util
+import sys
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+from code_editor import CodeEditorWindow
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,11 +43,9 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 def validate_folder_id(folder_id: str) -> bool:
-    """Проверяет валидность folder_id."""
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
 
 def fibonacci(n: int) -> int:
-    """Вычисляет n-е число Фибоначчи для формирования последовательности опыта."""
     if n <= 1:
         return n
     a, b = 0, 1
@@ -52,7 +55,6 @@ def fibonacci(n: int) -> int:
 
 class AudioManager:
     def play_sound(self, text: str, filename: str) -> None:
-        """Воспроизводит текст как аудио на русском языке."""
         try:
             tts = gTTS(text, lang="ru")
             tts.save(filename)
@@ -82,7 +84,6 @@ class Config:
             return cls._instance
 
     def _load_config(self):
-        """Загружает конфигурацию из файла или создает новую."""
         self.default_config = {
             "database": "nere_more_knowledge.json",
             "yandex": {
@@ -123,7 +124,6 @@ class Config:
             self._save_config()
 
     def _save_config(self):
-        """Сохраняет конфигурацию в файл."""
         try:
             with open("nere_more_config.json", "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=4)
@@ -131,7 +131,6 @@ class Config:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
     def _validate_and_update_on_startup(self):
-        """Проверяет и обновляет конфигурацию при запуске."""
         api_key = self.get_key()
         folder_id = self.get_folder_id()
         
@@ -154,7 +153,6 @@ class Config:
         return self.config
 
     def get_key(self) -> str:
-        """Возвращает расшифрованный API ключ."""
         for key in self.config["yandex"]["keys"]:
             if key["type"] == "gpt":
                 try:
@@ -164,7 +162,6 @@ class Config:
         return ""
 
     def update_api_key(self, key_id: str, value: str) -> bool:
-        """Обновляет API ключ после проверки."""
         temp_gpt = YandexGPT(value, self.get_folder_id())
         available, status = temp_gpt.check_availability()
         
@@ -183,11 +180,9 @@ class Config:
         return True
 
     def get_folder_id(self) -> str:
-        """Возвращает folder_id."""
         return self.config["yandex"].get("folder_id", "")
 
     def update_folder_id(self, folder_id: str) -> bool:
-        """Обновляет folder_id после проверки."""
         if not validate_folder_id(folder_id):
             logging.error("Недействительный folder_id")
             return False
@@ -209,7 +204,6 @@ class CodeOptimizationModule:
         self.config = config.data["code_classification"]
 
     def classify_code(self, code: str) -> Tuple[str, str]:
-        """Классифицирует код по назначению и местоположению."""
         purpose_score = {p: 0 for p in self.config["purposes"]}
         tokens = re.findall(r'\w+', code.lower())
         
@@ -232,7 +226,6 @@ class CodeOptimizationModule:
         return purpose, location
 
     def detect_errors(self, code: str) -> List[str]:
-        """Обнаруживает ошибки в коде."""
         errors = []
         try:
             ast.parse(code)
@@ -241,7 +234,6 @@ class CodeOptimizationModule:
         return errors if errors else ["Ошибок не обнаружено"]
 
     def analyze_structure(self, code: str) -> Dict[str, List[str]]:
-        """Анализирует структуру кода."""
         tree = ast.parse(code)
         structure = {"functions": [], "classes": []}
         
@@ -254,7 +246,6 @@ class CodeOptimizationModule:
         return structure
 
     def suggest_structure(self, code: str, errors: List[str]) -> str:
-        """Предлагает улучшения структуры кода."""
         suggestions = []
         try:
             tree = ast.parse(code, mode='exec', type_comments=True)
@@ -269,7 +260,6 @@ class CodeOptimizationModule:
         return "\n".join(suggestions) if suggestions else "Структура корректна."
 
     def duplicate_structure(self, code: str) -> str:
-        """Дублирует структуру кода."""
         tree = ast.parse(code)
         duplicated_code = []
         
@@ -280,7 +270,6 @@ class CodeOptimizationModule:
         return "\n\n".join(duplicated_code) if duplicated_code else code
 
     def suggest_integration_points(self, code: str, location: str) -> List[Tuple[str, str]]:
-        """Предлагает точки интеграции для кода."""
         integration_points = []
         tree = ast.parse(code)
         
@@ -294,7 +283,6 @@ class CodeOptimizationModule:
 
 class YandexGPT:
     def __init__(self, api_key: str, folder_id: str):
-        """Инициализирует YandexGPT с API ключом и folder_id."""
         self.api_key = api_key
         self.folder_id = folder_id
         self.url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -306,7 +294,6 @@ class YandexGPT:
         self._validate_credentials()
 
     def _validate_credentials(self):
-        """Проверяет валидность учетных данных."""
         if not self.api_key or len(self.api_key.strip()) < 10:
             self.status = "Ошибка: API-ключ пустой или слишком короткий"
             return
@@ -316,7 +303,6 @@ class YandexGPT:
         self.check_availability()
 
     def check_availability(self) -> Tuple[bool, str]:
-        """Проверяет доступность API."""
         try:
             headers = {
                 "Content-Type": "application/json",
@@ -340,7 +326,6 @@ class YandexGPT:
             return self.available, self.status
 
     def invoke(self, json_payload: Dict[str, Any]) -> str:
-        """Выполняет запрос к YandexGPT."""
         if not self.available:
             return f"API отключен: {self.status}"
         
@@ -350,7 +335,7 @@ class YandexGPT:
                 "Authorization": f"Api-Key {self.api_key}"
             }
             
-            response = requests.post(self.url, headers=headers, json=json_payload)
+            response = requests.post(self.url, headers=headers, json=payload)
             if response.status_code != 200:
                 return f"Ошибка: {response.status_code} {response.reason}"
             
@@ -374,11 +359,10 @@ class KnowledgeBase:
         self.vectorizer_fitted = False
         self.experience_level = 0
         self.learning_rate = 0.0
-        self.context_history = deque(maxlen=50)  # Хранит историю для логической последовательности
+        self.context_history = deque(maxlen=50)
         self._load_state()
 
     def _load_state(self):
-        """Загружает состояние векторайзера и кластеризации."""
         try:
             if os.path.exists("vectorizer.pkl") and os.path.exists("kmeans.pkl"):
                 self.vectorizer = joblib.load("vectorizer.pkl")
@@ -403,7 +387,6 @@ class KnowledgeBase:
             self.vectorizer_fitted = False
 
     def _save_state(self):
-        """Сохраняет состояние моделей."""
         if self.vectorizer_fitted:
             try:
                 joblib.dump(self.vectorizer, "vectorizer.pkl")
@@ -412,7 +395,6 @@ class KnowledgeBase:
                 logging.error(f"Ошибка сохранения моделей: {e}")
 
     def _ensure_vectorizer_fitted(self, text: str):
-        """Обеспечивает обучение векторайзера."""
         if not self.vectorizer_fitted:
             docs = [entry['response'] for entry in self.db.all() if 'response' in entry]
             if not docs:
@@ -424,16 +406,14 @@ class KnowledgeBase:
             self._save_state()
 
     def update_experience(self) -> float:
-        """Обновляет уровень опыта и процент обучения на основе числа записей."""
         self.experience_level += 1
-        fib_value = fibonacci(min(self.experience_level, 20))  # Ограничиваем рост для реалистичности
-        self.learning_rate = min(100.0, fib_value * 0.5)  # Увеличиваем медленнее, до 100%
+        fib_value = fibonacci(min(self.experience_level, 20))
+        self.learning_rate = min(100.0, fib_value * 0.5)
         self.config["learning"]["learning_rate"] = self.learning_rate
         Config()._save_config()
         return self.learning_rate
 
     def save(self, query: str, response: str, context: str = "", feedback: float = 0.0):
-        """Сохраняет запрос и ответ в базу знаний, обновляя опыт."""
         with self._lock:
             if len(response.strip()) < 5:
                 return
@@ -456,7 +436,6 @@ class KnowledgeBase:
             self.context_history.append(f"Вопрос: {query}\nОтвет: {response}")
 
     def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
-        """Возвращает похожие записи из базы знаний."""
         self._ensure_vectorizer_fitted(query)
         query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
         all_data = [(entry['query'], entry['response'], np.frombuffer(entry['embeddings'], dtype=np.float16))
@@ -469,7 +448,6 @@ class KnowledgeBase:
         return [(q, r, float(s)) for (q, r, _), s in results]
 
     def save_web_content(self, url: str, query: str) -> bool:
-        """Сохраняет контент с веб-страницы и обновляет опыт."""
         try:
             response = requests.get(url, timeout=10)
             response.raise_for_status()
@@ -484,16 +462,14 @@ class KnowledgeBase:
             return False
 
     def build_context(self, query: str) -> str:
-        """Формирует контекст на основе накопленного опыта."""
         similar = self.get_similar(query, top_n=3)
         context = "\n\n".join([f"Ранее: {q}\nОтвет: {r} (сходство: {s:.2f})" for q, r, s in similar])
         if not context:
             context = "У меня пока мало опыта по этому вопросу, но я постараюсь ответить на основе доступных данных."
-        history = "\n".join(list(self.context_history)[-5:])  # Последние 5 записей для последовательности
+        history = "\n".join(list(self.context_history)[-5:])
         return f"История взаимодействия:\n{history}\n\nПрошлый опыт:\n{context}"
 
     def _clear_cache(self, text_id: str = None):
-        """Очищает кэш базы знаний."""
         with self._lock:
             if text_id:
                 self.db.remove(Query().query.matches(f".*ID: {text_id}.*"))
@@ -524,7 +500,6 @@ class YandexAIServices:
                 gui_parent.status_label.configure(text=f"Ошибка API: {status}")
 
     def _request_credentials_if_needed(self):
-        """Запрашивает учетные данные, если они отсутствуют."""
         if not validate_folder_id(self.config.get_folder_id()):
             folder_id = ctk.CTkInputDialog(text="Введите folder_id (20 символов):", title="Folder ID").get_input()
             if folder_id and self.config.update_folder_id(folder_id):
@@ -537,18 +512,69 @@ class YandexAIServices:
     def check_api_key(self) -> Tuple[bool, str]:
         return self.gpt.check_availability()
 
+    def suggest_action_algorithm(self, query: str, user_emotion: Optional[float] = None) -> str:
+        if user_emotion is None:
+            sia = SentimentIntensityAnalyzer()
+            sentiment = sia.polarity_scores(query)
+            user_emotion = sentiment['compound']
+
+        keywords = re.findall(r'\w+', query.lower())
+        main_focus = max(keywords, key=lambda w: len(w), default="запрос")
+
+        similar_entries = self.knowledge.get_similar(query, top_n=5)
+        memory_context = "\n".join([f"[{s:.2f}] {r}" for _, r, s in similar_entries]) if similar_entries else "Нет схожих данных"
+
+        if user_emotion > 0.3:
+            tone = "оптимистичный"
+            suggestion = "Продолжайте задавать вопросы, я помогу вам с радостью!"
+        elif user_emotion < -0.3:
+            tone = "поддерживающий"
+            suggestion = "Не переживайте, я здесь, чтобы помочь разобраться!"
+        else:
+            tone = "нейтральный"
+            suggestion = "Давайте разберем ваш запрос шаг за шагом."
+
+        built_context = self.knowledge.build_context(query)
+        prompt = {
+            "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
+            "completionOptions": {
+                "stream": False,
+                "temperature": 0.5,
+                "maxTokens": 2000
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "text": f"Ты ассистент с уровнем опыта {self.knowledge.learning_rate:.1f}%. Используй накопленные знания и адаптируйся к эмоциональному состоянию пользователя (тон: {tone})."
+                },
+                {
+                    "role": "user",
+                    "text": f"Контекст:\n{memory_context}\n\nЗапрос: {query}\n\nОсновной фокус: {main_focus}"
+                }
+            ]
+        }
+        response = self.gpt.invoke(prompt)
+        self.knowledge.save(query, response, context=f"Эмоциональный тон: {tone}, Фокус: {main_focus}")
+        return (
+            f"Основной фокус: {main_focus}\n"
+            f"Эмоциональный тон: {tone}\n"
+            f"Предложение: {suggestion}\n"
+            f"Ответ: {response}\n"
+            f"[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
+        )
+
     def generate_response(self, query: str, context: str = "") -> str:
-        """Генерирует ответ на основе опыта и интернет-ресурсов."""
         if not query:
             return "Ошибка: Запрос пуст"
         
-        # Обработка URL
+        if "код" not in query.lower() and "code" not in query.lower() and not re.findall(r'https?://\S+', query):
+            return self.suggest_action_algorithm(query)
+        
         urls = re.findall(r'https?://\S+', query)
         if urls:
             success = self.knowledge.save_web_content(urls[0], query)
             return f"Сохранено с {urls[0]}\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]" if success else f"Ошибка с {urls[0]}"
         
-        # Обработка кода
         if "код" in query.lower() or "code" in query.lower():
             try:
                 formatted_code = black.format_str(query, mode=black.FileMode())
@@ -560,13 +586,12 @@ class YandexAIServices:
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
         
-        # Формирование ответа на основе опыта
         built_context = self.knowledge.build_context(query)
         prompt = {
             "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
             "completionOptions": {
                 "stream": False,
-                "temperature": max(0.3, 0.6 - (self.knowledge.learning_rate / 200)),  # Температура снижается с опытом
+                "temperature": max(0.3, 0.6 - (self.knowledge.learning_rate / 200)),
                 "maxTokens": 2000
             },
             "messages": [
@@ -619,210 +644,6 @@ class CodePasteWindow(ctk.CTkToplevel):
         current_width, current_height = map(int, self.geometry().split('x')[0:2])
         if current_width > 200 and current_height > 200:
             self.geometry(f"{current_width - 100}x{current_height - 100}")
-
-class CodeEditorWindow(ctk.CTkToplevel):
-    def __init__(self, parent, services):
-        super().__init__(parent)
-        self.title("Редактор кода")
-        self.geometry("1000x700")
-        self.services = services
-        self.parent = parent
-        self.original_code = ""
-        self._init_ui()
-        self._configure_syntax_highlighting()
-
-    def _init_ui(self):
-        self.main_frame = ctk.CTkFrame(self, fg_color="#1C2526")
-        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        self.code_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
-        self.code_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        self.code_entry = tk.Text(self.code_frame, height=25, width=40, bg="#1C2526", fg="#FFFFFF", insertbackground="white", font=("Courier", 12))
-        self.code_entry.pack(fill="both", expand=True, pady=5)
-        self.code_entry.insert("1.0", "# Введите код здесь\n")
-        self.code_entry.bind("<KeyRelease>", self._update_output)
-        self.original_code = self.code_entry.get("1.0", "end-1c").strip()
-
-        self.output_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
-        self.output_frame.pack(side="right", fill="both", expand=True, padx=5)
-
-        self.formatted_label = ctk.CTkLabel(self.output_frame, text="Отформатированный код:", text_color="#FFFFFF")
-        self.formatted_label.pack(pady=2)
-        self.formatted_output = tk.Text(self.output_frame, height=15, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
-        self.formatted_output.pack(fill="both", expand=True, pady=5)
-
-        self.changes_label = ctk.CTkLabel(self.output_frame, text="Изменения и интеграция:", text_color="#FFFFFF")
-        self.changes_label.pack(pady=2)
-        self.changes_output = tk.Text(self.output_frame, height=15, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
-        self.changes_output.pack(fill="both", expand=True, pady=5)
-
-        button_frame = ctk.CTkFrame(self.main_frame, fg_color="#2F3536")
-        button_frame.pack(fill="x", pady=5)
-        
-        ctk.CTkButton(button_frame, text="Сохранить", command=self._save_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Проверить", command=self._inspect_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Применить", command=self._apply_to_app, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Дублировать", command=self._duplicate_structure, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Отмена", command=self.destroy, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
-
-    def _configure_syntax_highlighting(self):
-        self.code_entry.tag_configure("keyword", foreground="#FF5555")
-        self.code_entry.tag_configure("string", foreground="#55FF55")
-        self.code_entry.tag_configure("comment", foreground="#888888")
-        self.formatted_output.tag_configure("keyword", foreground="#FF5555")
-        self.formatted_output.tag_configure("string", foreground="#55FF55")
-        self.formatted_output.tag_configure("comment", foreground="#888888")
-        self.changes_output.tag_configure("keyword", foreground="#FF5555")
-        self.changes_output.tag_configure("string", foreground="#55FF55")
-        self.changes_output.tag_configure("comment", foreground="#888888")
-        self.changes_output.tag_configure("integration", background="#4444FF", foreground="#FFFFFF")
-        self.changes_output.tag_configure("change", background="#FF4444", foreground="#FFFFFF")
-
-    def _highlight_syntax(self, text_widget, code):
-        text_widget.mark_set("range_start", "1.0")
-        
-        for tag in ("keyword", "string", "comment", "integration", "change"):
-            text_widget.tag_remove(tag, "1.0", "end")
-
-        keywords = {"def", "class", "if", "else", "for", "while", "import", "from", "return", "try", "except"}
-        for word in keywords:
-            start = "1.0"
-            while True:
-                pos = text_widget.search(r"\m" + word + r"\M", start, stopindex="end", regexp=True)
-                if not pos:
-                    break
-                text_widget.tag_add("keyword", pos, f"{pos}+{len(word)}c")
-                start = f"{pos}+{len(word)}c"
-
-        for match in re.finditer(r'["\'].*?["\']', code):
-            start = f"1.0 + {match.start()} chars"
-            end = f"1.0 + {match.end()} chars"
-            text_widget.tag_add("string", start, end)
-
-        for match in re.finditer(r"#.*$", code, re.MULTILINE):
-            start = f"1.0 + {match.start()} chars"
-            end = f"1.0 + {match.end()} chars"
-            text_widget.tag_add("comment", start, end)
-
-    def _update_output(self, event=None):
-        self._highlight_syntax(self.code_entry, self.code_entry.get("1.0", "end-1c"))
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            self.formatted_output.delete("1.0", "end")
-            self.formatted_output.insert("1.0", "Код пуст")
-            self.changes_output.delete("1.0", "end")
-            self.changes_output.insert("1.0", "Нет кода для анализа")
-            return
-
-        try:
-            formatted_code = black.format_str(code, mode=black.FileMode())
-        except Exception as e:
-            formatted_code = code + f"\n# Ошибка форматирования: {e}"
-        
-        purpose, location = self.services.code_optimizer.classify_code(code)
-        errors = self.services.code_optimizer.detect_errors(code)
-        integration_points = self.services.code_optimizer.suggest_integration_points(code, location)
-
-        self.formatted_output.delete("1.0", "end")
-        self.formatted_output.insert("1.0", formatted_code)
-        self._highlight_syntax(self.formatted_output, formatted_code)
-
-        changes_text = formatted_code
-        original_lines = self.original_code.splitlines()
-        new_lines = formatted_code.splitlines()
-        
-        for i, (orig, new) in enumerate(zip(original_lines, new_lines)):
-            if orig != new:
-                start_pos = f"{i+1}.0"
-                end_pos = f"{i+1}.end"
-                self.changes_output.tag_add("change", start_pos, end_pos)
-
-        for name, suggestion in integration_points:
-            for i, line in enumerate(new_lines):
-                if name in line:
-                    start_pos = f"{i+1}.0"
-                    end_pos = f"{i+1}.end"
-                    self.changes_output.tag_add("integration", start_pos, end_pos)
-                    changes_text += f"\n# {suggestion}"
-
-        self.changes_output.delete("1.0", "end")
-        self.changes_output.insert("1.0", changes_text)
-        self._highlight_syntax(self.changes_output, changes_text)
-
-    def _inspect_code(self):
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            messagebox.showwarning("Предупреждение", "Код пустой")
-            return
-
-        purpose, location = self.services.code_optimizer.classify_code(code)
-        errors = self.services.code_optimizer.detect_errors(code)
-        structure = self.services.code_optimizer.analyze_structure(code)
-        suggestions = self.services.code_optimizer.suggest_structure(code, errors)
-        integration_points = self.services.code_optimizer.suggest_integration_points(code, location)
-
-        inspection_text = (
-            f"Инспекция кода:\n"
-            f"Классификация: {purpose} ({location})\n"
-            f"Структура:\n- Функции: {', '.join(structure['functions']) or 'Нет'}\n- Классы: {', '.join(structure['classes']) or 'Нет'}\n"
-            f"Ошибки:\n" + "\n".join(errors) + "\n"
-            f"Рекомендации:\n{suggestions}\n"
-            f"Точки интеграции:\n" + "\n".join([f"- {suggestion}" for _, suggestion in integration_points]) + "\n"
-        )
-        
-        self.parent.display_response(inspection_text)
-
-    def _save_code(self):
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            messagebox.showwarning("Предупреждение", "Код пустой")
-            return
-
-        purpose, location = self.services.code_optimizer.classify_code(code)
-        errors = self.services.code_optimizer.detect_errors(code)
-        formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
-
-        code_id = uuid.uuid4().hex[:8]
-        self.services.knowledge.save(f"Modified code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
-        
-        self.parent.display_response(f"Код сохранен (ID: {code_id}):\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors))
-
-    def _apply_to_app(self):
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            messagebox.showwarning("Предупреждение", "Код пустой")
-            return
-
-        purpose, location = self.services.code_optimizer.classify_code(code)
-        errors = self.services.code_optimizer.detect_errors(code)
-        formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
-
-        module_name = "custom_module"
-        with open(f"{module_name}.py", "w", encoding="utf-8") as f:
-            f.write(formatted_code)
-        
-        spec = importlib.util.spec_from_file_location(module_name, f"{module_name}.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-
-        code_id = uuid.uuid4().hex[:8]
-        self.services.knowledge.save(f"Applied code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
-        
-        self.parent.display_response(f"Код применен к приложению (ID: {code_id}):\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors))
-        self.destroy()
-
-    def _duplicate_structure(self):
-        code = self.code_entry.get("1.0", "end-1c").strip()
-        if not code:
-            messagebox.showwarning("Предупреждение", "Код пустой")
-            return
-        
-        duplicated_code = self.services.code_optimizer.duplicate_structure(code)
-        self.code_entry.delete("1.0", "end")
-        self.code_entry.insert("1.0", duplicated_code)
-        self._update_output()
 
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
@@ -1051,5 +872,6 @@ class APIKeyCheckWindow(ctk.CTkToplevel):
             self.status_text.insert("1.0", f"Статус: {status}")
 
 if __name__ == "__main__":
+    nltk.download('vader_lexicon', quiet=True)
     app = NereMoreInterface()
     app.run()
