@@ -295,7 +295,7 @@ class YandexGPT:
         self.max_tokens = 500
         self.available = False
         self.status = "Не проверено"
-        self.response_cache = OrderedDict(maxlen=1000)  # Кэш ответов
+        self.response_cache = OrderedDict(maxlen=1000)
         self._validate_credentials()
 
     def _validate_credentials(self):
@@ -518,6 +518,7 @@ class YandexAIServices:
         self._request_credentials_if_needed()
         self.knowledge = KnowledgeBase(self)
         self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
+        self.code_optimizer = CodeOptimizationModule(self.config)
         
         available, status = self.gpt.check_availability()
         if not available:
@@ -560,15 +561,15 @@ class YandexAIServices:
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
         logging.info("Начало инициализации интерфейса")
+        self.initialized = False  # Инициализируем атрибут заранее
         try:
             super().__init__()
             self.title("Nere More")
             self.geometry("800x600")
-            self.configure(fg_color="transparent")
             self.attributes('-alpha', 0.95)  # Прозрачность окна
             
-            # Основной фрейм с полупрозрачным фоном
-            self.main_frame = ctk.CTkFrame(self, fg_color="#1C2526", bg_color="#1C2526CC")
+            # Основной фрейм с темно-синим фоном
+            self.main_frame = ctk.CTkFrame(self, fg_color="#1C2526")
             self.main_frame.pack(fill="both", expand=True)
 
             self.audio = AudioManager()
@@ -592,7 +593,7 @@ class NereMoreInterface(ctk.CTk):
             self.input_entry.bind("<Return>", lambda e: self.process_input())
 
             # Кнопки
-            self.button_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+            self.button_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
             self.button_frame.pack(pady=10)
             buttons = [
                 ("Вставить", lambda: CodePasteWindow(self, self._paste_text_callback)),
@@ -610,12 +611,11 @@ class NereMoreInterface(ctk.CTk):
                                   command=cmd)
                 btn.pack(side="left", padx=5)
 
-            # Область результатов с эффектом падения
+            # Область результатов
             self.results_text = ctk.CTkTextbox(self.main_frame, width=700, height=300,
                                              font=("Arial", 20),
                                              text_color="black",
-                                             fg_color="transparent",
-                                             bg_color="#1C2526CC")
+                                             fg_color="#1C2526")
             self.results_text.pack(pady=20)
 
             self.status_label = ctk.CTkLabel(self.main_frame, text="Готов", 
@@ -639,7 +639,7 @@ class NereMoreInterface(ctk.CTk):
         for i, line in enumerate(lines):
             self.results_text.insert(f"{i+1}.0", line + '\n')
             self.results_text.update()
-            time.sleep(0.05)  # Эффект падения текста
+            time.sleep(0.05)
 
     def _on_closing(self):
         logging.info("Закрытие приложения")
@@ -693,7 +693,7 @@ class NereMoreInterface(ctk.CTk):
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
 
     def run(self):
-        if self.initialized:
+        if hasattr(self, 'initialized') and self.initialized:
             logging.info("Запуск приложения")
             self.mainloop()
         else:
@@ -704,7 +704,7 @@ class CodePasteWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("Вставка кода")
         self.geometry("400x300")
-        self.configure(fg_color="transparent")
+        self.attributes('-alpha', 0.95)
         self.callback = callback
         self._init_ui()
 
@@ -716,7 +716,7 @@ class CodePasteWindow(ctk.CTkToplevel):
         self.code_entry.pack(padx=10, pady=10, fill="both", expand=True)
         self.code_entry.insert("1.0", "Вставьте код или текст здесь\n")
 
-        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame = ctk.CTkFrame(self, fg_color="#1C2526")
         button_frame.pack(fill="x", padx=10, pady=5)
         
         ctk.CTkButton(button_frame, text="Вставить", command=self._paste_code,
@@ -735,7 +735,7 @@ class APISettingsWindow(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("Настройка API")
         self.geometry("300x250")
-        self.configure(fg_color="transparent")
+        self.attributes('-alpha', 0.95)
         self.config = config
         self._init_ui()
 
