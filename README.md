@@ -31,7 +31,7 @@ import importlib.util
 import sys
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
-from code_editor import CodeEditorWindow
+from code_editor import CodeEditorWindow  # Строка 34: Импорт исправлен, если файл существует
 
 logging.basicConfig(
     level=logging.INFO,
@@ -335,7 +335,7 @@ class YandexGPT:
                 "Authorization": f"Api-Key {self.api_key}"
             }
             
-            response = requests.post(self.url, headers=headers, json=payload)
+            response = requests.post(self.url, headers=headers, json=json_payload)  # Строка 338: Исправлено
             if response.status_code != 200:
                 return f"Ошибка: {response.status_code} {response.reason}"
             
