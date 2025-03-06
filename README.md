@@ -439,10 +439,9 @@ class KnowledgeBase:
                 self.db.truncate()
                 self.query_cache.clear()
                 self.vectorizer_fitted = False
-            self._save_state()
 
     def _save_state(self):
-        pass  # Убрано сохранение моделей для упрощения
+        pass
 
 class YandexAIServices:
     def __init__(self, gui_parent=None):
