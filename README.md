@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, OrderedDict
 import json
 import logging
 import hashlib
@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import messagebox
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics.pairwise import cosine_similarity
 import uuid
 import pygame
@@ -17,8 +18,13 @@ import time
 from http.client import HTTPSConnection
 import threading
 import ast
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import re
+from bs4 import BeautifulSoup
+from docx import Document
+import openpyxl
+from tinydb import TinyDB, Query
+import joblib
 from cryptography.fernet import Fernet
 import black
 from pylint import lint
@@ -76,11 +82,22 @@ class Config:
         self.default_config = {
             "database": "nere_more_knowledge.json",
             "yandex": {
-                "iam_token": "",
+                "keys": [{"id": "gpt_key_1", "value": "", "type": "gpt"}],
                 "folder_id": ""
             },
             "ui": {"animation_speed": 0.05, "max_context": 10, "audio_enabled": True},
-            "learning": {"feedback_weight": 0.9}
+            "learning": {"cluster_size": 5, "feedback_weight": 0.9},
+            "code_classification": {
+                "purposes": ["algorithm", "UI", "data_processing", "network", "utility"],
+                "locations": ["core", "GUI", "services", "knowledge"],
+                "keywords": {
+                    "algorithm": ["def", "for", "while", "if"],
+                    "UI": ["tkinter", "ctk", "label", "button"],
+                    "data_processing": ["numpy", "sklearn", "pandas"],
+                    "network": ["requests", "socket"],
+                    "utility": ["os", "logging", "time"]
+                }
+            }
         }
         config_file = "nere_more_config.json"
         try:
@@ -109,43 +126,51 @@ class Config:
             logging.error(f"Ошибка сохранения конфигурации: {e}")
 
     def _validate_and_update_on_startup(self):
-        iam_token = self.get_iam_token()
+        api_key = self.get_key()
         folder_id = self.get_folder_id()
         
-        if not iam_token or not folder_id:
-            logging.info("IAM-токен или folder_id отсутствуют, используются значения по умолчанию")
-            self.update_iam_token("default_iam_token")
+        if not api_key or not folder_id:
+            logging.info("API ключ или folder_id отсутствуют, используются значения по умолчанию")
+            self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
             self.update_folder_id("b1g170pkl3ihbn8bc3kd")
             return
             
-        temp_gpt = YandexGPT(iam_token, folder_id)
+        temp_gpt = YandexGPT(api_key, folder_id)
         available, status = temp_gpt.check_availability()
         
         if not available:
             logging.warning(f"Сохраненные данные недействительны: {status}. Установка значений по умолчанию")
-            self.update_iam_token("default_iam_token")
+            self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
             self.update_folder_id("b1g170pkl3ihbn8bc3kd")
 
     @property
     def data(self) -> Dict[str, Any]:
         return self.config
 
-    def get_iam_token(self) -> str:
-        try:
-            return self._cipher.decrypt(self.config["yandex"]["iam_token"].encode()).decode()
-        except Exception:
-            return self.config["yandex"]["iam_token"]
+    def get_key(self) -> str:
+        for key in self.config["yandex"]["keys"]:
+            if key["type"] == "gpt":
+                try:
+                    return self._cipher.decrypt(key["value"].encode()).decode()
+                except Exception:
+                    return key["value"]
+        return ""
 
-    def update_iam_token(self, value: str) -> bool:
+    def update_api_key(self, key_id: str, value: str) -> bool:
         temp_gpt = YandexGPT(value, self.get_folder_id())
         available, status = temp_gpt.check_availability()
         
         if not available:
-            logging.error(f"Новый IAM-токен недействителен: {status}")
+            logging.error(f"Новый API ключ недействителен: {status}")
             return False
             
         encrypted_value = self._cipher.encrypt(value.encode()).decode()
-        self.config["yandex"]["iam_token"] = encrypted_value
+        for key in self.config["yandex"]["keys"]:
+            if key["id"] == key_id:
+                key["value"] = encrypted_value
+                self._save_config()
+                return True
+        self.config["yandex"]["keys"].append({"id": key_id, "value": encrypted_value, "type": "gpt"})
         self._save_config()
         return True
 
@@ -157,12 +182,12 @@ class Config:
             logging.error("Недействительный folder_id")
             return False
             
-        iam_token = self.get_iam_token()
-        if iam_token:
-            temp_gpt = YandexGPT(iam_token, folder_id)
+        api_key = self.get_key()
+        if api_key:
+            temp_gpt = YandexGPT(api_key, folder_id)
             available, status = temp_gpt.check_availability()
             if not available:
-                logging.error(f"folder_id недействителен с текущим токеном: {status}")
+                logging.error(f"folder_id недействителен с текущим ключом: {status}")
                 return False
                 
         self.config["yandex"]["folder_id"] = folder_id
@@ -171,17 +196,7 @@ class Config:
 
 class CodeOptimizationModule:
     def __init__(self, config: Config):
-        self.config = config.data.get("code_classification", {
-            "purposes": ["algorithm", "UI", "data_processing", "network", "utility"],
-            "locations": ["core", "GUI", "services", "knowledge"],
-            "keywords": {
-                "algorithm": ["def", "for", "while", "if"],
-                "UI": ["tkinter", "ctk", "label", "button"],
-                "data_processing": ["numpy", "sklearn", "pandas"],
-                "network": ["requests", "socket"],
-                "utility": ["os", "logging", "time"]
-            }
-        })
+        self.config = config.data["code_classification"]
 
     def classify_code(self, code: str) -> Tuple[str, str]:
         purpose_score = {p: 0 for p in self.config["purposes"]}
@@ -293,8 +308,8 @@ class CodeOptimizationModule:
             return f"Ошибка: {str(e)}"
 
 class YandexGPT:
-    def __init__(self, iam_token: str, folder_id: str):
-        self.iam_token = iam_token
+    def __init__(self, api_key: str, folder_id: str):
+        self.api_key = api_key
         self.folder_id = folder_id
         self.url = "llm.api.cloud.yandex.net"
         self.path = "/foundationModels/v1/completion"
@@ -306,8 +321,8 @@ class YandexGPT:
         self._validate_credentials()
 
     def _validate_credentials(self):
-        if not self.iam_token or len(self.iam_token.strip()) < 10:
-            self.status = "Ошибка: IAM-токен пустой или слишком короткий"
+        if not self.api_key or len(self.api_key.strip()) < 10:
+            self.status = "Ошибка: API-ключ пустой или слишком короткий"
             return
         if not validate_folder_id(self.folder_id):
             self.status = "Ошибка: folder_id должен быть 20 символов (буквы/цифры)"
@@ -319,8 +334,7 @@ class YandexGPT:
             conn = HTTPSConnection(self.url)
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.iam_token}",
-                "x-folder-id": self.folder_id
+                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
             }
             payload = {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
@@ -351,8 +365,7 @@ class YandexGPT:
             conn = HTTPSConnection(self.url)
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.iam_token}",
-                "x-folder-id": self.folder_id
+                "Authorization": f"Api-Key {self.api_key}".encode('latin-1')
             }
             
             payload = json_payload or {
@@ -362,8 +375,15 @@ class YandexGPT:
                     "temperature": self.temperature
                 },
                 "messages": [
-                    {"role": "system", "text": "Ты логичный и полезный помощник. Давай чёткие и понятные ответы."},
-                    {"role": "user", "text": query if not context else f"{context}\n{query}"}
+                    {
+                        "role": "system",
+                        "text": "Ты креативный помощник, который придумывает названия и описания для новых продуктов. "
+                                "Твои ответы должны быть в формате JSON."
+                    },
+                    {
+                        "role": "user",
+                        "text": query if not context else f"{context}\n{query}"
+                    }
                 ]
             }
             
@@ -376,37 +396,78 @@ class YandexGPT:
             result = response.read().decode('utf-8')
             conn.close()
             
-            json_result = json.loads(result)
-            return json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
+            try:
+                json_result = json.loads(result)
+                return json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
+            except json.JSONDecodeError:
+                return result
+                
         except Exception as e:
             logging.error(f"Ошибка Yandex GPT: {e}")
             return f"Ошибка сети: {str(e)}"
 
 class KnowledgeBase:
     def __init__(self, services: 'YandexAIServices'):
+        self.config = Config().data
         self.services = services
-        self.db = TinyDB("nere_more_knowledge.json")
+        self.db = TinyDB(self.config["database"])
         self.vectorizer = TfidfVectorizer(max_features=10000)
+        self.kmeans: Optional[MiniBatchKMeans] = None
         self._lock = threading.Lock()
-        self.query_cache = {}
+        self.embeddings_cache = OrderedDict(maxlen=1000)
+        self.query_cache = OrderedDict(maxlen=1000)
         self.vectorizer_fitted = False
-        self._fit_vectorizer()
+        self._load_state()
 
-    def _fit_vectorizer(self):
-        docs = [entry['response'] for entry in self.db.all() if 'response' in entry]
-        if docs:
+    def _load_state(self):
+        try:
+            if os.path.exists("vectorizer.pkl") and os.path.exists("kmeans.pkl"):
+                self.vectorizer = joblib.load("vectorizer.pkl")
+                self.kmeans = joblib.load("kmeans.pkl")
+                self.vectorizer_fitted = True
+            else:
+                docs = [entry['response'] for entry in self.db.all() if 'response' in entry]
+                if docs:
+                    self.vectorizer.fit(docs)
+                    self.vectorizer_fitted = True
+                    n_samples = len(docs)
+                    n_clusters = min(self.config["learning"]["cluster_size"], n_samples)
+                    self.kmeans = MiniBatchKMeans(n_clusters=n_clusters)
+                    embeddings = [np.frombuffer(entry['embeddings'], dtype=np.float16) for entry in self.db.all() if 'embeddings' in entry]
+                    if embeddings:
+                        self.kmeans.fit(np.stack(embeddings))
+                    self._save_state()
+        except Exception as e:
+            logging.error(f"Ошибка загрузки состояния: {e}")
+            self.vectorizer_fitted = False
+
+    def _save_state(self):
+        if self.vectorizer_fitted:
+            try:
+                joblib.dump(self.vectorizer, "vectorizer.pkl")
+                joblib.dump(self.kmeans, "kmeans.pkl")
+            except Exception as e:
+                logging.error(f"Ошибка сохранения моделей: {e}")
+
+    def _ensure_vectorizer_fitted(self, text: str):
+        if not self.vectorizer_fitted:
+            docs = [entry['response'] for entry in self.db.all() if 'response' in entry]
+            if not docs:
+                docs = [text]
             self.vectorizer.fit(docs)
             self.vectorizer_fitted = True
+            n_clusters = min(self.config["learning"]["cluster_size"], len(docs))
+            self.kmeans = MiniBatchKMeans(n_clusters=n_clusters)
+            self._save_state()
 
-    def save(self, query: str, response: str, context: str = ""):
+    def save(self, query: str, response: str, context: str = "", feedback: float = 0.0):
         with self._lock:
             if len(response.strip()) < 5:
                 return
             query_hash = hashlib.md5(query.encode()).hexdigest()
             self.query_cache[query_hash] = response
-            if not self.vectorizer_fitted:
-                self.vectorizer.fit([response])
-                self.vectorizer_fitted = True
+            self._ensure_vectorizer_fitted(response)
+            query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
             embeddings = self.vectorizer.transform([response]).toarray().astype(np.float16)[0]
             entry = {
                 'id': str(uuid.uuid4()),
@@ -414,13 +475,13 @@ class KnowledgeBase:
                 'response': response,
                 'context': context,
                 'embeddings': embeddings.tobytes(),
+                'feedback': feedback,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
             }
             self.db.insert(entry)
 
-    def get_similar(self, query: str, top_n: int = 1) -> List[Tuple[str, str, float]]:
-        if not self.vectorizer_fitted:
-            return []
+    def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
+        self._ensure_vectorizer_fitted(query)
         query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
         all_data = [(entry['query'], entry['response'], np.frombuffer(entry['embeddings'], dtype=np.float16))
                     for entry in self.db.all() if 'embeddings' in entry]
@@ -431,17 +492,34 @@ class KnowledgeBase:
         results = sorted(zip(all_data, similarities), key=lambda x: x[1], reverse=True)[:top_n]
         return [(q, r, float(s)) for (q, r, _), s in results]
 
+    def save_web_content(self, url: str, query: str) -> bool:
+        try:
+            conn = HTTPSConnection(url.split('/')[2])
+            conn.request("GET", '/' + '/'.join(url.split('/')[3:]))
+            response = conn.getresponse()
+            response.raise_for_status()
+            soup = BeautifulSoup(response.read(), 'html.parser')
+            text = soup.get_text(separator=' ', strip=True)
+            conn.close()
+            if text:
+                self.save(query, text, context=f"Извлечено с сайта: {url}")
+                return True
+            return False
+        except Exception as e:
+            logging.error(f"Ошибка извлечения с {url}: {e}")
+            return False
+
     def _clear_cache(self, text_id: str = None):
         with self._lock:
             if text_id:
                 self.db.remove(Query().query.matches(f".*ID: {text_id}.*"))
             else:
                 self.db.truncate()
+                self.embeddings_cache.clear()
                 self.query_cache.clear()
                 self.vectorizer_fitted = False
-
-    def _save_state(self):
-        pass
+                self.kmeans = None
+            self._save_state()
 
 class YandexAIServices:
     def __init__(self, gui_parent=None):
@@ -449,10 +527,8 @@ class YandexAIServices:
         self.gui_parent = gui_parent
         self._request_credentials_if_needed()
         self.knowledge = KnowledgeBase(self)
-        self.gpt = YandexGPT(self.config.get_iam_token(), self.config.get_folder_id())
+        self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
         self.code_optimizer = CodeOptimizationModule(self.config)
-        self.learning_progress = {"queries_processed": 0, "average_response_time": 0.0}
-        self.last_interaction = time.time()
         
         available, status = self.gpt.check_availability()
         if not available:
@@ -465,47 +541,31 @@ class YandexAIServices:
             folder_id = ctk.CTkInputDialog(text="Введите folder_id (20 символов):", title="Folder ID").get_input()
             if folder_id and self.config.update_folder_id(folder_id):
                 logging.info(f"Обновлен folder_id: {folder_id}")
-        if not self.config.get_iam_token():
-            iam_token = ctk.CTkInputDialog(text="Введите IAM-токен:", title="IAM Token").get_input()
-            if iam_token and self.config.update_iam_token(iam_token):
-                logging.info("IAM-токен обновлен")
+        if not self.config.get_key():
+            api_key = ctk.CTkInputDialog(text="Введите API-ключ:", title="API Key").get_input()
+            if api_key and self.config.update_api_key("gpt_key_1", api_key):
+                logging.info("API ключ обновлен")
 
     def check_api_key(self) -> Tuple[bool, str]:
         return self.gpt.check_availability()
 
     def generate_response(self, query: str, context: str = "") -> str:
-        start_time = time.time()
-        
-        if not query and (time.time() - self.last_interaction) > 30:
-            return "Ты давно молчишь! Давай я предложу идеи: хочешь обсудить код, проекты или что-то ещё?"
-        
-        self.last_interaction = time.time()
-        
         if not query:
-            return "Что ты хочешь обсудить? Я готов помочь!"
-        
+            return "Ошибка: Запрос пуст"
+        urls = re.findall(r'https?://\S+', query)
+        if urls:
+            return self.knowledge.save_web_content(urls[0], query) and f"Сохранено с {urls[0]}" or f"Ошибка с {urls[0]}"
+        if "код" in query.lower() or "code" in query.lower():
+            try:
+                formatted_code = black.format_str(query, mode=black.FileMode())
+                purpose, location = self.code_optimizer.classify_code(query)
+                errors = self.code_optimizer.detect_errors(query)
+                response = f"Отформатированный код:\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors)
+                return response
+            except Exception as e:
+                return f"Ошибка обработки кода: {e}"
         similar = self.knowledge.get_similar(query)
-        if similar and similar[0][2] > 0.9:
-            response = similar[0][1]
-        else:
-            response = self.gpt.invoke(query, context)
-            self.knowledge.save(query, response, context)
-        
-        self.learning_progress["queries_processed"] += 1
-        self.learning_progress["average_response_time"] = (
-            (self.learning_progress["average_response_time"] * (self.learning_progress["queries_processed"] - 1)) + 
-            (time.time() - start_time)) / self.learning_progress["queries_processed"]
-        )
-        
-        if "что ты хочешь" in query.lower():
-            response += "\nЯ могу помочь с кодом, анализом данных или просто поболтать. Что тебе интересно?"
-        
-        return response
-
-    def get_learning_progress(self) -> str:
-        return (f"Прогресс обучения:\n"
-                f"- Обработано запросов: {self.learning_progress['queries_processed']}\n"
-                f"- Среднее время ответа: {self.learning_progress['average_response_time']:.2f} сек")
+        return similar[0][1] if similar else self.gpt.invoke(query, context)
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
@@ -579,6 +639,12 @@ class CodeEditorWindow(ctk.CTkToplevel):
         self.changes_label.pack(pady=2)
         self.changes_output = tk.Text(self.output_frame, height=10, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
         self.changes_output.pack(fill="both", expand=True, pady=5)
+
+        self.terminal_label = ctk.CTkLabel(self.output_frame, text="Терминал:", text_color="#FFFFFF")
+        self.terminal_label.pack(pady=2)
+        self.terminal_output = ctk.CTkTextbox(self.output_frame, height=8, width=40, fg_color="#1C2526", text_color="#FFFFFF")
+        self.terminal_output.pack(fill="both", expand=True, pady=5)
+        self.terminal_output.insert("1.0", "Терминал готов\n")
 
         button_frame = ctk.CTkFrame(self.main_frame, fg_color="#2F3536")
         button_frame.pack(fill="x", pady=5)
@@ -678,7 +744,8 @@ class CodeEditorWindow(ctk.CTkToplevel):
     def _inspect_code(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.parent.display_response("Ошибка: Код пустой")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой\n")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
@@ -696,17 +763,23 @@ class CodeEditorWindow(ctk.CTkToplevel):
             f"Точки интеграции:\n" + "\n".join([f"- {suggestion}" for _, suggestion in integration_points]) + "\n"
         )
         
-        self.parent.display_response(inspection_text)
+        self.terminal_output.delete("1.0", "end")
+        self.terminal_output.insert("1.0", inspection_text)
 
     def _save_code(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.parent.display_response("Ошибка: Код пустой")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
         errors = self.services.code_optimizer.detect_errors(code)
         formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
+
+        temp_module = f"temp_module_{uuid.uuid4().hex[:8]}"
+        with open(f"{temp_module}.py", "w", encoding="utf-8") as f:
+            f.write(formatted_code)
 
         code_id = uuid.uuid4().hex[:8]
         self.services.knowledge.save(f"Modified code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
@@ -716,21 +789,24 @@ class CodeEditorWindow(ctk.CTkToplevel):
     def _run_code(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.parent.display_response("Ошибка: Код пустой")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
             return
 
         sandbox_globals = {}
+        self.terminal_output.delete("1.0", "end")
         try:
             exec(code, sandbox_globals)
-            self.parent.display_response("Код успешно выполнен в песочнице")
+            self.terminal_output.insert("1.0", "Код успешно выполнен в песочнице")
         except Exception as e:
             stack_trace = traceback.format_exc()
-            self.parent.display_response(f"Ошибка выполнения:\n{stack_trace}")
+            self.terminal_output.insert("1.0", f"Ошибка выполнения:\n{stack_trace}")
 
     def _apply_to_app(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.parent.display_response("Ошибка: Код пустой")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
             return
 
         purpose, location = self.services.code_optimizer.classify_code(code)
@@ -755,7 +831,8 @@ class CodeEditorWindow(ctk.CTkToplevel):
     def _duplicate_structure(self):
         code = self.code_entry.get("1.0", "end-1c").strip()
         if not code:
-            self.parent.display_response("Ошибка: Код пустой")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
             return
         
         duplicated_code = self.services.code_optimizer.duplicate_structure(code)
@@ -768,9 +845,10 @@ class CodeEditorWindow(ctk.CTkToplevel):
             screenshot = ImageGrab.grab(bbox=(self.winfo_x(), self.winfo_y(), self.winfo_x() + self.winfo_width(), self.winfo_y() + self.winfo_height()))
             filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
             screenshot.save(filename)
-            self.parent.display_response(f"Скриншот сохранен как {filename}")
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", f"Скриншот сохранен как {filename}")
         except Exception as e:
-            self.parent.display_response(f"Ошибка создания скриншота: {e}")
+            self.terminal_output.insert("1.0", f"Ошибка создания скриншота: {e}")
 
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
@@ -861,6 +939,8 @@ class NereMoreInterface(ctk.CTk):
 
     def process_input(self):
         query = self.input_entry.get().strip()
+        if not query:
+            return
         self.input_entry.delete(0, "end")
         if query.lower().startswith("clear cache"):
             text_id = query.split("ID:")[-1].strip() if "ID:" in query else None
@@ -884,6 +964,26 @@ class NereMoreInterface(ctk.CTk):
             self.services.knowledge.save(f"Inserted text (ID: {uuid.uuid4().hex[:8]})", content)
             self.display_response(f"Вставлено: {content[:100]}...")
 
+    def _paste_text(self):
+        CodePasteWindow(self, self._paste_text_callback)
+
+    def _read_docx(self, file_path: str) -> str:
+        try:
+            doc = Document(file_path)
+            return "\n".join(para.text for para in doc.paragraphs)
+        except Exception as e:
+            logging.error(f"Ошибка чтения .docx: {e}")
+            return ""
+
+    def _read_xlsx(self, file_path: str) -> str:
+        try:
+            workbook = openpyxl.load_workbook(file_path)
+            sheet = workbook.active
+            return "\n".join("\t".join(str(cell or "") for cell in row) for row in sheet.iter_rows(values_only=True))
+        except Exception as e:
+            logging.error(f"Ошибка чтения .xlsx: {e}")
+            return ""
+
     def _magnet_search(self):
         query = self.input_entry.get().strip()
         if query:
@@ -891,8 +991,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        progress = self.services.get_learning_progress()
-        self.display_response(f"Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Анализ скриншотов\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода\n\n{progress}")
+        self.display_response("Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Анализ скриншотов\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
@@ -913,10 +1012,10 @@ class APISettingsWindow(ctk.CTkToplevel):
         self._init_ui()
 
     def _init_ui(self):
-        ctk.CTkLabel(self, text="IAM Token:").grid(row=0, column=0, padx=5, pady=5)
+        ctk.CTkLabel(self, text="YandexGPT key:").grid(row=0, column=0, padx=5, pady=5)
         self.key_entry = ctk.CTkEntry(self, width=150)
         self.key_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.key_entry.insert(0, self.config.get_iam_token())
+        self.key_entry.insert(0, self.config.get_key())
 
         ctk.CTkButton(self, text="📋 Вставить", command=self._paste_key,
                      width=80, fg_color="#1C2526", hover_color="#4A4A4A").grid(row=0, column=2, padx=5)
@@ -961,7 +1060,7 @@ class APISettingsWindow(ctk.CTkToplevel):
         self.status_label.configure(text=status_message)
 
         if is_valid:
-            self.config.update_iam_token(key)
+            self.config.update_api_key("gpt_key_1", key)
             self.config.update_folder_id(folder_id)
             self.status_label.configure(text="Настройки сохранены")
             self.after(1000, self.destroy)
@@ -971,14 +1070,14 @@ class APISettingsWindow(ctk.CTkToplevel):
 class APIKeyCheckWindow(ctk.CTkToplevel):
     def __init__(self, parent, services, config):
         super().__init__(parent)
-        self.title("Проверка IAM-токена")
+        self.title("Проверка API ключа")
         self.geometry("400x300")
         self.services = services
         self.config = config
         self._init_ui()
 
     def _init_ui(self):
-        ctk.CTkLabel(self, text="Введите токен:").grid(row=0, column=0, padx=5, pady=5)
+        ctk.CTkLabel(self, text="Введите ключ:").grid(row=0, column=0, padx=5, pady=5)
         self.key_entry = ctk.CTkEntry(self, width=200)
         self.key_entry.grid(row=0, column=1)
         ctk.CTkLabel(self, text="Folder ID:").grid(row=1, column=0, padx=5, pady=5)
