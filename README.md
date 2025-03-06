@@ -27,6 +27,9 @@ from tinydb import TinyDB, Query
 import joblib
 from cryptography.fernet import Fernet
 import black
+from pylint import lint
+from io import StringIO
+from pylint.reporters.text import TextReporter
 from PIL import Image, ImageGrab
 import pytesseract
 import importlib.util
@@ -223,6 +226,22 @@ class CodeOptimizationModule:
             ast.parse(code)
         except SyntaxError as e:
             errors.append(f"Синтаксическая ошибка: {str(e)}")
+        
+        try:
+            output = StringIO()
+            reporter = TextReporter(output)
+            args = ["--from-stdin", "--persistent=n", "--score=n"]
+            pylint_run = lint.Run(args, reporter=reporter, do_exit=False)
+            pylint_run.linter.check_single_file("stdin", code.splitlines())
+            pylint_output = output.getvalue()
+            output.close()
+            
+            for line in pylint_output.splitlines():
+                if "error" in line.lower() or "warning" in line.lower():
+                    errors.append(line.strip())
+        except Exception as e:
+            errors.append(f"Ошибка анализа Pylint: {str(e)}")
+        
         return errors if errors else ["Ошибок не обнаружено"]
 
     def analyze_structure(self, code: str) -> Dict[str, List[str]]:
@@ -246,7 +265,11 @@ class CodeOptimizationModule:
             return "\n".join(suggestions)
         
         for error in errors:
-            if "syntax" in error.lower():
+            if "missing" in error.lower() and "docstring" in error.lower():
+                suggestions.append("Добавьте docstring для функций/классов.")
+            elif "undefined" in error.lower():
+                suggestions.append("Проверьте объявление переменных перед использованием.")
+            elif "syntax" in error.lower():
                 suggestions.append("Исправьте синтаксическую ошибку (например, скобки, отступы).")
         
         return "\n".join(suggestions) if suggestions else "Структура корректна."
@@ -295,7 +318,6 @@ class YandexGPT:
         self.max_tokens = 500
         self.available = False
         self.status = "Не проверено"
-        self.response_cache = OrderedDict(maxlen=1000)
         self._validate_credentials()
 
     def _validate_credentials(self):
@@ -335,15 +357,10 @@ class YandexGPT:
 
     def invoke(self, query: str = None, context: str = "", json_payload: Dict[str, Any] = None) -> str:
         if not self.available:
-            return "API недоступен"
+            return f"API отключен: {self.status}"
         if not query and not json_payload:
-            return "Запрос пустой"
+            return "Ошибка: Запрос пустой"
         
-        query_hash = hashlib.md5((query + context).encode()).hexdigest()
-        if query_hash in self.response_cache:
-            logging.info(f"Ответ взят из кэша для запроса: {query}")
-            return self.response_cache[query_hash]
-
         try:
             conn = HTTPSConnection(self.url)
             headers = {
@@ -360,7 +377,8 @@ class YandexGPT:
                 "messages": [
                     {
                         "role": "system",
-                        "text": "Предоставь четкий и понятный ответ в формате JSON с полями 'answer' и 'details'."
+                        "text": "Ты креативный помощник, который придумывает названия и описания для новых продуктов. "
+                                "Твои ответы должны быть в формате JSON."
                     },
                     {
                         "role": "user",
@@ -373,28 +391,20 @@ class YandexGPT:
             response = conn.getresponse()
             if response.status != 200:
                 conn.close()
-                return f"Ошибка: {response.status}"
+                return f"Ошибка: {response.status} {response.reason}"
             
             result = response.read().decode('utf-8')
             conn.close()
             
             try:
                 json_result = json.loads(result)
-                text = json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "Нет данных")
-                json_response = json.loads(text)
-                answer = json_response.get("answer", "Нет ответа")
-                details = json_response.get("details", "Нет деталей")
-                final_response = f"{answer}\n\nДетали: {details}"
-                self.response_cache[query_hash] = final_response
-                logging.info(f"Получен и закэширован ответ для запроса: {query}")
-                return final_response
+                return json_result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
             except json.JSONDecodeError:
-                logging.error(f"Ошибка парсинга JSON: {result}")
-                return "Ошибка обработки ответа"
+                return result
                 
         except Exception as e:
             logging.error(f"Ошибка Yandex GPT: {e}")
-            return "Ошибка сети"
+            return f"Ошибка сети: {str(e)}"
 
 class KnowledgeBase:
     def __init__(self, services: 'YandexAIServices'):
@@ -541,105 +551,376 @@ class YandexAIServices:
 
     def generate_response(self, query: str, context: str = "") -> str:
         if not query:
-            return "Запрос пуст"
+            return "Ошибка: Запрос пуст"
         urls = re.findall(r'https?://\S+', query)
         if urls:
-            success = self.knowledge.save_web_content(urls[0], query)
-            return f"Сохранено с {urls[0]}" if success else f"Ошибка с {urls[0]}"
+            return self.knowledge.save_web_content(urls[0], query) and f"Сохранено с {urls[0]}" or f"Ошибка с {urls[0]}"
         if "код" in query.lower() or "code" in query.lower():
             try:
                 formatted_code = black.format_str(query, mode=black.FileMode())
                 purpose, location = self.code_optimizer.classify_code(query)
                 errors = self.code_optimizer.detect_errors(query)
-                response = f"Код:\n{formatted_code}\n\nНазначение: {purpose}\nМесто: {location}\nОшибки: {', '.join(errors)}"
+                response = f"Отформатированный код:\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors)
                 return response
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
         similar = self.knowledge.get_similar(query)
         return similar[0][1] if similar else self.gpt.invoke(query, context)
 
+class CodePasteWindow(ctk.CTkToplevel):
+    def __init__(self, parent, callback):
+        super().__init__(parent)
+        self.title("Вставка кода")
+        self.geometry("400x300")
+        self.callback = callback
+        self._init_ui()
+
+    def _init_ui(self):
+        self.code_entry = ctk.CTkTextbox(self, width=380, height=200, fg_color="#1C2526", text_color="#FFFFFF", font=("Courier", 12))
+        self.code_entry.pack(padx=10, pady=10, fill="both", expand=True)
+        self.code_entry.insert("1.0", "# Вставьте код здесь\n")
+
+        button_frame = ctk.CTkFrame(self, fg_color="#2F3536")
+        button_frame.pack(fill="x", padx=10, pady=5)
+        
+        ctk.CTkButton(button_frame, text="Вставить", command=self._paste_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Увеличить", command=self._enlarge_window, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Уменьшить", command=self._shrink_window, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Отмена", command=self.destroy, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+
+    def _paste_code(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if code:
+            self.callback(code)
+        self.destroy()
+
+    def _enlarge_window(self):
+        current_width, current_height = map(int, self.geometry().split('x')[0:2])
+        self.geometry(f"{current_width + 100}x{current_height + 100}")
+
+    def _shrink_window(self):
+        current_width, current_height = map(int, self.geometry().split('x')[0:2])
+        if current_width > 200 and current_height > 200:
+            self.geometry(f"{current_width - 100}x{current_height - 100}")
+
+class CodeEditorWindow(ctk.CTkToplevel):
+    def __init__(self, parent, services):
+        super().__init__(parent)
+        self.title("Редактор кода")
+        self.geometry("1000x700")
+        self.services = services
+        self.parent = parent
+        self.original_code = ""
+        self._init_ui()
+        self._configure_syntax_highlighting()
+
+    def _init_ui(self):
+        self.main_frame = ctk.CTkFrame(self, fg_color="#1C2526")
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.code_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
+        self.code_frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.code_entry = tk.Text(self.code_frame, height=25, width=40, bg="#1C2526", fg="#FFFFFF", insertbackground="white", font=("Courier", 12))
+        self.code_entry.pack(fill="both", expand=True, pady=5)
+        self.code_entry.insert("1.0", "# Введите код здесь\n")
+        self.code_entry.bind("<KeyRelease>", self._update_output)
+        self.original_code = self.code_entry.get("1.0", "end-1c").strip()
+
+        self.output_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
+        self.output_frame.pack(side="right", fill="both", expand=True, padx=5)
+
+        self.formatted_label = ctk.CTkLabel(self.output_frame, text="Отформатированный код:", text_color="#FFFFFF")
+        self.formatted_label.pack(pady=2)
+        self.formatted_output = tk.Text(self.output_frame, height=10, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
+        self.formatted_output.pack(fill="both", expand=True, pady=5)
+
+        self.changes_label = ctk.CTkLabel(self.output_frame, text="Изменения и интеграция:", text_color="#FFFFFF")
+        self.changes_label.pack(pady=2)
+        self.changes_output = tk.Text(self.output_frame, height=10, width=40, bg="#1C2526", fg="#FFFFFF", font=("Courier", 12))
+        self.changes_output.pack(fill="both", expand=True, pady=5)
+
+        self.terminal_label = ctk.CTkLabel(self.output_frame, text="Терминал:", text_color="#FFFFFF")
+        self.terminal_label.pack(pady=2)
+        self.terminal_output = ctk.CTkTextbox(self.output_frame, height=8, width=40, fg_color="#1C2526", text_color="#FFFFFF")
+        self.terminal_output.pack(fill="both", expand=True, pady=5)
+        self.terminal_output.insert("1.0", "Терминал готов\n")
+
+        button_frame = ctk.CTkFrame(self.main_frame, fg_color="#2F3536")
+        button_frame.pack(fill="x", pady=5)
+        
+        ctk.CTkButton(button_frame, text="Сохранить", command=self._save_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Проверить", command=self._inspect_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Запустить", command=self._run_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Применить", command=self._apply_to_app, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Дублировать", command=self._duplicate_structure, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Скриншот", command=self._take_screenshot, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+        ctk.CTkButton(button_frame, text="Отмена", command=self.destroy, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
+
+    def _configure_syntax_highlighting(self):
+        self.code_entry.tag_configure("keyword", foreground="#FF5555")
+        self.code_entry.tag_configure("string", foreground="#55FF55")
+        self.code_entry.tag_configure("comment", foreground="#888888")
+        self.formatted_output.tag_configure("keyword", foreground="#FF5555")
+        self.formatted_output.tag_configure("string", foreground="#55FF55")
+        self.formatted_output.tag_configure("comment", foreground="#888888")
+        self.changes_output.tag_configure("keyword", foreground="#FF5555")
+        self.changes_output.tag_configure("string", foreground="#55FF55")
+        self.changes_output.tag_configure("comment", foreground="#888888")
+        self.changes_output.tag_configure("integration", background="#4444FF", foreground="#FFFFFF")
+        self.changes_output.tag_configure("change", background="#FF4444", foreground="#FFFFFF")
+
+    def _highlight_syntax(self, text_widget, code):
+        text_widget.mark_set("range_start", "1.0")
+        
+        for tag in ("keyword", "string", "comment", "integration", "change"):
+            text_widget.tag_remove(tag, "1.0", "end")
+
+        keywords = {"def", "class", "if", "else", "for", "while", "import", "from", "return", "try", "except"}
+        for word in keywords:
+            start = "1.0"
+            while True:
+                pos = text_widget.search(r"\m" + word + r"\M", start, stopindex="end", regexp=True)
+                if not pos:
+                    break
+                text_widget.tag_add("keyword", pos, f"{pos}+{len(word)}c")
+                start = f"{pos}+{len(word)}c"
+
+        for match in re.finditer(r'["\'].*?["\']', code):
+            start = f"1.0 + {match.start()} chars"
+            end = f"1.0 + {match.end()} chars"
+            text_widget.tag_add("string", start, end)
+
+        for match in re.finditer(r"#.*$", code, re.MULTILINE):
+            start = f"1.0 + {match.start()} chars"
+            end = f"1.0 + {match.end()} chars"
+            text_widget.tag_add("comment", start, end)
+
+    def _update_output(self, event=None):
+        self._highlight_syntax(self.code_entry, self.code_entry.get("1.0", "end-1c"))
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.formatted_output.delete("1.0", "end")
+            self.formatted_output.insert("1.0", "Код пуст")
+            self.changes_output.delete("1.0", "end")
+            self.changes_output.insert("1.0", "Нет кода для анализа")
+            return
+
+        try:
+            formatted_code = black.format_str(code, mode=black.FileMode())
+        except Exception as e:
+            formatted_code = code + f"\n# Ошибка форматирования: {e}"
+        
+        purpose, location = self.services.code_optimizer.classify_code(code)
+        errors = self.services.code_optimizer.detect_errors(code)
+        integration_points = self.services.code_optimizer.suggest_integration_points(code, location)
+
+        self.formatted_output.delete("1.0", "end")
+        self.formatted_output.insert("1.0", formatted_code)
+        self._highlight_syntax(self.formatted_output, formatted_code)
+
+        changes_text = formatted_code
+        original_lines = self.original_code.splitlines()
+        new_lines = formatted_code.splitlines()
+        
+        for i, (orig, new) in enumerate(zip(original_lines, new_lines)):
+            if orig != new:
+                start_pos = f"{i+1}.0"
+                end_pos = f"{i+1}.end"
+                self.changes_output.tag_add("change", start_pos, end_pos)
+
+        for name, suggestion in integration_points:
+            for i, line in enumerate(new_lines):
+                if name in line:
+                    start_pos = f"{i+1}.0"
+                    end_pos = f"{i+1}.end"
+                    self.changes_output.tag_add("integration", start_pos, end_pos)
+                    changes_text += f"\n# {suggestion}"
+
+        self.changes_output.delete("1.0", "end")
+        self.changes_output.insert("1.0", changes_text)
+        self._highlight_syntax(self.changes_output, changes_text)
+
+    def _inspect_code(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой\n")
+            return
+
+        purpose, location = self.services.code_optimizer.classify_code(code)
+        errors = self.services.code_optimizer.detect_errors(code)
+        structure = self.services.code_optimizer.analyze_structure(code)
+        suggestions = self.services.code_optimizer.suggest_structure(code, errors)
+        integration_points = self.services.code_optimizer.suggest_integration_points(code, location)
+
+        inspection_text = (
+            f"Инспекция кода:\n"
+            f"Классификация: {purpose} ({location})\n"
+            f"Структура:\n- Функции: {', '.join(structure['functions']) or 'Нет'}\n- Классы: {', '.join(structure['classes']) or 'Нет'}\n"
+            f"Ошибки:\n" + "\n".join(errors) + "\n"
+            f"Рекомендации:\n{suggestions}\n"
+            f"Точки интеграции:\n" + "\n".join([f"- {suggestion}" for _, suggestion in integration_points]) + "\n"
+        )
+        
+        self.terminal_output.delete("1.0", "end")
+        self.terminal_output.insert("1.0", inspection_text)
+
+    def _save_code(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            return
+
+        purpose, location = self.services.code_optimizer.classify_code(code)
+        errors = self.services.code_optimizer.detect_errors(code)
+        formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
+
+        temp_module = f"temp_module_{uuid.uuid4().hex[:8]}"
+        with open(f"{temp_module}.py", "w", encoding="utf-8") as f:
+            f.write(formatted_code)
+
+        code_id = uuid.uuid4().hex[:8]
+        self.services.knowledge.save(f"Modified code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
+        
+        self.parent.display_response(f"Код сохранен (ID: {code_id}):\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors))
+
+    def _run_code(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            return
+
+        sandbox_globals = {}
+        self.terminal_output.delete("1.0", "end")
+        try:
+            exec(code, sandbox_globals)
+            self.terminal_output.insert("1.0", "Код успешно выполнен в песочнице")
+        except Exception as e:
+            stack_trace = traceback.format_exc()
+            self.terminal_output.insert("1.0", f"Ошибка выполнения:\n{stack_trace}")
+
+    def _apply_to_app(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            return
+
+        purpose, location = self.services.code_optimizer.classify_code(code)
+        errors = self.services.code_optimizer.detect_errors(code)
+        formatted_code = black.format_str(code, mode=black.FileMode()) if not errors else code
+
+        module_name = "custom_module"
+        with open(f"{module_name}.py", "w", encoding="utf-8") as f:
+            f.write(formatted_code)
+        
+        spec = importlib.util.spec_from_file_location(module_name, f"{module_name}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+        code_id = uuid.uuid4().hex[:8]
+        self.services.knowledge.save(f"Applied code (ID: {code_id})", formatted_code, context=f"Location: {location}, Purpose: {purpose}")
+        
+        self.parent.display_response(f"Код применен к приложению (ID: {code_id}):\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors))
+        self.destroy()
+
+    def _duplicate_structure(self):
+        code = self.code_entry.get("1.0", "end-1c").strip()
+        if not code:
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", "Ошибка: Код пустой")
+            return
+        
+        duplicated_code = self.services.code_optimizer.duplicate_structure(code)
+        self.code_entry.delete("1.0", "end")
+        self.code_entry.insert("1.0", duplicated_code)
+        self._update_output()
+
+    def _take_screenshot(self):
+        try:
+            screenshot = ImageGrab.grab(bbox=(self.winfo_x(), self.winfo_y(), self.winfo_x() + self.winfo_width(), self.winfo_y() + self.winfo_height()))
+            filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
+            screenshot.save(filename)
+            self.terminal_output.delete("1.0", "end")
+            self.terminal_output.insert("1.0", f"Скриншот сохранен как {filename}")
+        except Exception as e:
+            self.terminal_output.insert("1.0", f"Ошибка создания скриншота: {e}")
+
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
-        logging.info("Начало инициализации интерфейса")
-        self.initialized = False  # Инициализируем атрибут заранее
+        logging.info("Шаг 0: Начало инициализации NereMoreInterface")
         try:
             super().__init__()
             self.title("Nere More")
-            self.geometry("800x600")
-            self.attributes('-alpha', 0.95)  # Прозрачность окна
-            
-            # Основной фрейм с темно-синим фоном
-            self.main_frame = ctk.CTkFrame(self, fg_color="#1C2526")
-            self.main_frame.pack(fill="both", expand=True)
+            self.geometry("600x450")
+            self.configure(fg_color="#1C2526")
+            self.initialized = False
 
             self.audio = AudioManager()
             self.services = YandexAIServices(self)
             self.config = Config()
             self.context = deque(maxlen=self.config.data["ui"]["max_context"] * 2)
 
-            # Заголовок
-            self.logo_label = ctk.CTkLabel(self.main_frame, text="Nere More", 
-                                         font=("Arial", 32, "bold"), 
-                                         text_color="black")
-            self.logo_label.pack(pady=20)
+            self.logo_label = ctk.CTkLabel(self, text="Nere More", font=("Arial", 20, "bold"), text_color="#FFFFFF")
+            self.logo_label.pack(pady=10)
 
-            # Поле ввода
-            self.input_entry = ctk.CTkEntry(self.main_frame, width=600, height=50,
-                                          font=("Arial", 20), 
-                                          text_color="black",
-                                          fg_color="white",
-                                          placeholder_text="Введите запрос...")
-            self.input_entry.pack(pady=10)
+            self.input_frame = ctk.CTkFrame(self, fg_color="#2F3536", corner_radius=10)
+            self.input_frame.pack(fill="x", padx=10, pady=5)
+            self.input_entry = ctk.CTkEntry(self.input_frame, width=350, height=40, font=("Arial", 14),
+                                            placeholder_text="Введите запрос...", fg_color="#1C2526", text_color="#FFFFFF")
+            self.input_entry.pack(side="left", padx=10, pady=5)
             self.input_entry.bind("<Return>", lambda e: self.process_input())
 
-            # Кнопки
-            self.button_frame = ctk.CTkFrame(self.main_frame, fg_color="#1C2526")
-            self.button_frame.pack(pady=10)
             buttons = [
-                ("Вставить", lambda: CodePasteWindow(self, self._paste_text_callback)),
-                ("Поиск", self._magnet_search),
-                ("Обработать", self.process_input),
-                ("Умения", self.show_skills),
-                ("Настройки", lambda: APISettingsWindow(self, self.config)),
+                ("📋", lambda: CodePasteWindow(self, self._paste_text_callback), "Вставить"),
+                ("🧲", self._magnet_search, "Поиск"),
+                ("🔍", self.process_input, "Обработать"),
+                ("🌟", self.show_skills, "Умения"),
+                ("⚙️", lambda: APISettingsWindow(self, self.config), "Настройки"),
+                ("🔑", lambda: APIKeyCheckWindow(self, self.services, self.config), "Проверка ключа"),
+                ("💻", lambda: CodeEditorWindow(self, self.services), "Редактор кода"),
             ]
-            for text, cmd in buttons:
-                btn = ctk.CTkButton(self.button_frame, text=text, width=100, height=40,
-                                  font=("Arial", 16),
-                                  text_color="black",
-                                  fg_color="white",
-                                  hover_color="#D3D3D3",
-                                  command=cmd)
+            for text, cmd, hover in buttons:
+                btn = ctk.CTkButton(self.input_frame, text=text, width=40, height=40, fg_color="#1C2526", hover_color="#4A4A4A",
+                                   text_color="#FFFFFF", command=cmd)
                 btn.pack(side="left", padx=5)
 
-            # Область результатов
-            self.results_text = ctk.CTkTextbox(self.main_frame, width=700, height=300,
-                                             font=("Arial", 20),
-                                             text_color="black",
-                                             fg_color="#1C2526")
-            self.results_text.pack(pady=20)
+            self.results_text = ctk.CTkTextbox(self, width=580, height=300, fg_color="#2F3536", text_color="#FFFFFF")
+            self.results_text.pack(padx=10, pady=5)
 
-            self.status_label = ctk.CTkLabel(self.main_frame, text="Готов", 
-                                           font=("Arial", 16), 
-                                           text_color="black")
-            self.status_label.pack(pady=10)
+            self.button_frame = ctk.CTkFrame(self, fg_color="#2F3536")
+            self.button_frame.pack(fill="x", padx=10, pady=5)
+            compact_buttons = [
+                ("📋", lambda: CodePasteWindow(self, self._paste_text_callback), "Вставить"),
+                ("🧲", self._magnet_search, "Поиск"),
+                ("🔍", self.process_input, "Обработать"),
+                ("🌟", self.show_skills, "Умения"),
+                ("⚙️", lambda: APISettingsWindow(self, self.config), "Настройки"),
+                ("🔑", lambda: APIKeyCheckWindow(self, self.services, self.config), "Проверка"),
+                ("💻", lambda: CodeEditorWindow(self, self.services), "Редактор"),
+            ]
+            for text, cmd, hover in compact_buttons:
+                btn = ctk.CTkButton(self.button_frame, text=text, width=30, height=30, fg_color="#1C2526", hover_color="#4A4A4A",
+                                   text_color="#FFFFFF", command=cmd)
+                btn.pack(side="left", padx=2)
+
+            self.status_label = ctk.CTkLabel(self, text="Инициализация...", font=("Arial", 10), text_color="#FFFFFF")
+            self.status_label.pack(side="bottom", pady=2)
 
             available, status = self.services.check_api_key()
-            self.status_label.configure(text=f"Статус: {status}")
+            self.status_label.configure(text=f"Статус API: {status}")
 
             self.protocol("WM_DELETE_WINDOW", self._on_closing)
             self.initialized = True
+            self.status_label.configure(text="Готов")
         except Exception as e:
-            logging.error(f"Ошибка инициализации: {e}", exc_info=True)
-            messagebox.showerror("Ошибка", f"Не удалось запустить: {e}")
+            logging.error(f"Критическая ошибка инициализации: {e}", exc_info=True)
+            messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение: {e}")
             self.destroy()
-
-    def _animate_text(self, text: str):
-        self.results_text.delete("1.0", "end")
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            self.results_text.insert(f"{i+1}.0", line + '\n')
-            self.results_text.update()
-            time.sleep(0.05)
 
     def _on_closing(self):
         logging.info("Закрытие приложения")
@@ -649,7 +930,12 @@ class NereMoreInterface(ctk.CTk):
         self.destroy()
 
     def display_response(self, text: str):
-        threading.Thread(target=self._animate_text, args=(text,), daemon=True).start()
+        self.results_text.delete("1.0", "end")
+        try:
+            json_response = json.loads(text)
+            self.results_text.insert("1.0", json.dumps(json_response, ensure_ascii=False, indent=2))
+        except json.JSONDecodeError:
+            self.results_text.insert("1.0", text)
 
     def process_input(self):
         query = self.input_entry.get().strip()
@@ -671,101 +957,102 @@ class NereMoreInterface(ctk.CTk):
             purpose, location = self.services.code_optimizer.classify_code(content)
             errors = self.services.code_optimizer.detect_errors(content)
             formatted_code = black.format_str(content, mode=black.FileMode()) if not errors else content
-            response = f"Код:\n{formatted_code}\n\nНазначение: {purpose}\nМесто: {location}\nОшибки: {', '.join(errors)}"
+            response = f"Код вставлен:\n{formatted_code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n" + "\n".join(errors)
             self.services.knowledge.save(f"Inserted code (ID: {uuid.uuid4().hex[:8]})", formatted_code)
             self.display_response(response)
         else:
             self.services.knowledge.save(f"Inserted text (ID: {uuid.uuid4().hex[:8]})", content)
-            self.display_response(f"Вставлено:\n{content}")
+            self.display_response(f"Вставлено: {content[:100]}...")
+
+    def _paste_text(self):
+        CodePasteWindow(self, self._paste_text_callback)
+
+    def _read_docx(self, file_path: str) -> str:
+        try:
+            doc = Document(file_path)
+            return "\n".join(para.text for para in doc.paragraphs)
+        except Exception as e:
+            logging.error(f"Ошибка чтения .docx: {e}")
+            return ""
+
+    def _read_xlsx(self, file_path: str) -> str:
+        try:
+            workbook = openpyxl.load_workbook(file_path)
+            sheet = workbook.active
+            return "\n".join("\t".join(str(cell or "") for cell in row) for row in sheet.iter_rows(values_only=True))
+        except Exception as e:
+            logging.error(f"Ошибка чтения .xlsx: {e}")
+            return ""
 
     def _magnet_search(self):
         query = self.input_entry.get().strip()
         if query:
             similar = self.services.knowledge.get_similar(query)
-            response = "\n".join(f"[{s:.2f}] {q}:\n{r}" for q, r, s in similar) or "Нет данных"
-            self.display_response(response)
+            self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        skills = "Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Анализ скриншотов\n- Обнаружение ошибок"
-        self.display_response(skills)
+        self.display_response("Умения:\n- Генерация текста\n- Обработка кода\n- Работа с файлами\n- Анализ скриншотов\n- Обнаружение ошибок\n- Редактирование кода\n- Динамическая перезагрузка\n- Дублирование структуры\n- Инспекция кода")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
 
     def run(self):
-        if hasattr(self, 'initialized') and self.initialized:
-            logging.info("Запуск приложения")
+        if self.initialized:
+            logging.info("Запуск основного цикла приложения")
             self.mainloop()
         else:
-            logging.error("Не инициализировано")
-
-class CodePasteWindow(ctk.CTkToplevel):
-    def __init__(self, parent, callback):
-        super().__init__(parent)
-        self.title("Вставка кода")
-        self.geometry("400x300")
-        self.attributes('-alpha', 0.95)
-        self.callback = callback
-        self._init_ui()
-
-    def _init_ui(self):
-        self.code_entry = ctk.CTkTextbox(self, width=380, height=200, 
-                                       font=("Arial", 16),
-                                       text_color="black",
-                                       fg_color="white")
-        self.code_entry.pack(padx=10, pady=10, fill="both", expand=True)
-        self.code_entry.insert("1.0", "Вставьте код или текст здесь\n")
-
-        button_frame = ctk.CTkFrame(self, fg_color="#1C2526")
-        button_frame.pack(fill="x", padx=10, pady=5)
-        
-        ctk.CTkButton(button_frame, text="Вставить", command=self._paste_code,
-                     font=("Arial", 14), text_color="black", fg_color="white").pack(side="left", padx=5)
-        ctk.CTkButton(button_frame, text="Отмена", command=self.destroy,
-                     font=("Arial", 14), text_color="black", fg_color="white").pack(side="left", padx=5)
-
-    def _paste_code(self):
-        content = self.code_entry.get("1.0", "end-1c").strip()
-        if content:
-            self.callback(content)
-        self.destroy()
+            logging.error("Приложение не инициализировано, запуск невозможен")
 
 class APISettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent, config):
         super().__init__(parent)
         self.title("Настройка API")
         self.geometry("300x250")
-        self.attributes('-alpha', 0.95)
         self.config = config
         self._init_ui()
 
     def _init_ui(self):
-        ctk.CTkLabel(self, text="YandexGPT key:", font=("Arial", 16), text_color="black").pack(pady=5)
-        self.key_entry = ctk.CTkEntry(self, width=200, font=("Arial", 14), text_color="black", fg_color="white")
-        self.key_entry.pack(pady=5)
+        ctk.CTkLabel(self, text="YandexGPT key:").grid(row=0, column=0, padx=5, pady=5)
+        self.key_entry = ctk.CTkEntry(self, width=150)
+        self.key_entry.grid(row=0, column=1, padx=5, pady=5)
         self.key_entry.insert(0, self.config.get_key())
 
-        ctk.CTkLabel(self, text="Folder ID:", font=("Arial", 16), text_color="black").pack(pady=5)
-        self.folder_entry = ctk.CTkEntry(self, width=200, font=("Arial", 14), text_color="black", fg_color="white")
-        self.folder_entry.pack(pady=5)
+        ctk.CTkButton(self, text="📋 Вставить", command=self._paste_key,
+                     width=80, fg_color="#1C2526", hover_color="#4A4A4A").grid(row=0, column=2, padx=5)
+
+        ctk.CTkLabel(self, text="Folder ID:").grid(row=1, column=0, padx=5, pady=5)
+        self.folder_entry = ctk.CTkEntry(self, width=150)
+        self.folder_entry.grid(row=1, column=1, padx=5, pady=5)
         self.folder_entry.insert(0, self.config.get_folder_id())
 
         ctk.CTkButton(self, text="Сохранить", command=self._save_api_key,
-                     font=("Arial", 14), text_color="black", fg_color="white").pack(pady=10)
+                     fg_color="#1C2526", hover_color="#4A4A4A").grid(row=2, column=0, columnspan=3, pady=10)
 
-        self.status_label = ctk.CTkLabel(self, text="", font=("Arial", 14), text_color="black")
-        self.status_label.pack(pady=5)
+        self.status_label = ctk.CTkLabel(self, text="")
+        self.status_label.grid(row=3, column=0, columnspan=3, pady=5)
+
+    def _paste_key(self):
+        try:
+            clipboard_text = self.clipboard_get()
+            if clipboard_text:
+                self.key_entry.delete(0, "end")
+                self.key_entry.insert(0, clipboard_text)
+                self.status_label.configure(text="Текст вставлен из буфера")
+            else:
+                self.status_label.configure(text="Буфер обмена пуст")
+        except tk.TclError:
+            self.status_label.configure(text="Ошибка доступа к буферу")
 
     def _save_api_key(self):
         key = self.key_entry.get().strip()
         folder_id = self.folder_entry.get().strip()
 
         if not key or not folder_id:
-            self.status_label.configure(text="Поля не могут быть пустыми")
+            self.status_label.configure(text="Ошибка: Поля не могут быть пустыми")
             return
 
         if not validate_folder_id(folder_id):
-            self.status_label.configure(text="folder_id должен быть 20 символов")
+            self.status_label.configure(text="Ошибка: folder_id должен быть 20 символов (буквы/цифры)")
             return
 
         temp_gpt = YandexGPT(key, folder_id)
@@ -775,8 +1062,40 @@ class APISettingsWindow(ctk.CTkToplevel):
         if is_valid:
             self.config.update_api_key("gpt_key_1", key)
             self.config.update_folder_id(folder_id)
-            self.status_label.configure(text="Сохранено")
+            self.status_label.configure(text="Настройки сохранены")
             self.after(1000, self.destroy)
+        else:
+            self.status_label.configure(text=f"Ошибка: {status_message}")
+
+class APIKeyCheckWindow(ctk.CTkToplevel):
+    def __init__(self, parent, services, config):
+        super().__init__(parent)
+        self.title("Проверка API ключа")
+        self.geometry("400x300")
+        self.services = services
+        self.config = config
+        self._init_ui()
+
+    def _init_ui(self):
+        ctk.CTkLabel(self, text="Введите ключ:").grid(row=0, column=0, padx=5, pady=5)
+        self.key_entry = ctk.CTkEntry(self, width=200)
+        self.key_entry.grid(row=0, column=1)
+        ctk.CTkLabel(self, text="Folder ID:").grid(row=1, column=0, padx=5, pady=5)
+        self.folder_entry = ctk.CTkEntry(self, width=200)
+        self.folder_entry.grid(row=1, column=1)
+        self.folder_entry.insert(0, self.config.get_folder_id())
+        ctk.CTkButton(self, text="Проверить", command=self._check_key).grid(row=2, column=0, columnspan=2, pady=10)
+        self.status_text = ctk.CTkTextbox(self, width=350, height=100)
+        self.status_text.grid(row=3, column=0, columnspan=2)
+
+    def _check_key(self):
+        key = self.key_entry.get()
+        folder_id = self.folder_entry.get()
+        if key and validate_folder_id(folder_id):
+            gpt = YandexGPT(key, folder_id)
+            available, status = gpt.check_availability()
+            self.status_text.delete("1.0", "end")
+            self.status_text.insert("1.0", f"Статус: {status}")
 
 if __name__ == "__main__":
     app = NereMoreInterface()
