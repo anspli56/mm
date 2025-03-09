@@ -174,14 +174,14 @@ class SentimentAnalyzer:
 
     def analyze_mood_trend(self) -> Dict[str, Any]:
         if not self.mood_history:
-            return {"current_mood": 0.0, "average_mood": 0.0, "trend": _("нет данных")}
+            return {"current_mood": 0.0, "average_mood": 0.0, "trend": "No data"}
         current_mood = self.mood_history[-1]
         average_mood = sum(self.mood_history) / len(self.mood_history)
-        trend = _("рост") if all(a <= b for a, b in zip(list(self.mood_history)[-5:], list(self.mood_history)[-4:])) else _("спад") if all(a >= b for a, b in zip(list(self.mood_history)[-5:], list(self.mood_history)[-4:])) else _("стабильное")
+        trend = "increasing" if all(a <= b for a, b in zip(list(self.mood_history)[-5:], list(self.mood_history)[-4:])) else "decreasing" if all(a >= b for a, b in zip(list(self.mood_history)[-5:], list(self.mood_history)[-4:])) else "stable"
         return {"current_mood": current_mood, "average_mood": average_mood, "trend": trend}
 
     def interpret_mood(self, mood_score: float) -> str:
-        return _("позитивное") if mood_score > 0.5 else _("негативное") if mood_score < -0.5 else _("нейтральное")
+        return "positive" if mood_score > 0.5 else "negative" if mood_score < -0.5 else "neutral"
 
 # Input Validation
 class UserInput(BaseModel):
@@ -248,15 +248,15 @@ class KnowledgeBase:
                     soup = BeautifulSoup(await resp.text(), 'html.parser')
                     text = soup.get_text(separator=' ', strip=True)
                     if text:
-                        await self.save(query, text, context=f"Извлечено с сайта: {url}")
+                        await self.save(query, text, context=f"Extracted from {url}")
                         return True
         return False
 
     async def build_context(self, query: str) -> str:
         similar = await self.get_similar(query, 3)
-        context = "\n\n".join([f"Ранее: {q}\nОтвет: {r} (сходство: {s:.2f})" for q, r, s in similar]) or _("Нет схожих данных")
+        context = "\n\n".join([f"Previously: {q}\nResponse: {r} (similarity: {s:.2f})" for q, r, s in similar]) or "No similar data"
         history = "\n".join(list(self.context_history)[-5:])
-        return f"{_('История')}:\n{history}\n\n{_('Прошлый опыт')}:\n{context}"
+        return f"History:\n{history}\n\nPast experience:\n{context}"
 
 # YandexGPT with Async
 class YandexGPT:
@@ -266,7 +266,7 @@ class YandexGPT:
         self.url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         self.model = "yandexgpt-lite"
         self.available = False
-        self.status = _("Не проверено")
+        self.status = "Not checked"
 
     @wraps
     async def check_availability(self) -> Tuple[bool, str]:
@@ -275,13 +275,13 @@ class YandexGPT:
             payload = {"modelUri": f"gpt://{self.folder_id}/{self.model}", "messages": [{"role": "user", "text": "Test"}]}
             async with session.post(self.url, headers=headers, json=payload) as resp:
                 self.available = resp.status == 200
-                self.status = _("Доступно") if self.available else f"{_('Ошибка')}: {resp.status}"
+                self.status = "Available" if self.available else f"Error: {resp.status}"
                 return self.available, self.status
 
     @wraps
     async def invoke(self, json_payload: Dict[str, Any]) -> str:
         if not self.available:
-            return f"{_('API отключен')}: {self.status}"
+            return f"API is unavailable: {self.status}"
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
             async with session.post(self.url, headers=headers, json=json_payload) as resp:
@@ -302,7 +302,7 @@ class NeuroSymbolicReasoner:
 
     def _extract_symbolic(self, text: str) -> float:
         x = symbols('x')
-        if "happy" in text.lower() or "счастлив" in text.lower():
+        if "happy" in text.lower() or "happy" in text.lower():
             return float(simplify("x + 0.5").subs(x, 0))
         return 0.0
 
@@ -359,25 +359,25 @@ class YandexAIServices:
         try:
             validated = UserInput(query=query, context=context)
         except ValidationError:
-            return _("Ошибка валидации")
+            return "Validation error"
         
         start_time = time.time()
         self.metrics["requests"] += 1
         urls = re.findall(r'https?://\S+', query)
         if urls:
             success = await self.knowledge.save_web_content(urls[0], query)
-            return f"{_('Сохранено с')} {urls[0]}" if success else f"{_('Ошибка с')} {urls[0]}"
+            return f"Saved from {urls[0]}" if success else f"Error from {urls[0]}"
         
         user_emotion = await self.neuro_symbolic.reason(query)
         mood_analysis = self.sentiment_analyzer.analyze_mood_trend()
-        tone = _("радостный") if user_emotion > 0.5 else _("поддерживающий") if user_emotion < -0.5 else _("нейтральный")
+        tone = "happy" if user_emotion > 0.5 else "supportive" if user_emotion < -0.5 else "neutral"
         built_context = await self.knowledge.build_context(query)
         prompt = {
             "modelUri": f"gpt://{self.gpt.folder_id}/{self.gpt.model}",
             "completionOptions": {"temperature": 0.5, "maxTokens": 2000},
             "messages": [
-                {"role": "system", "text": f"{_('Тон')}: {tone}"},
-                {"role": "user", "text": f"{_('Контекст')}: {built_context}\n{_('Запрос')}: {query}"}
+                {"role": "system", "text": f"Tone: {tone}"},
+                {"role": "user", "text": f"Context: {built_context}\nQuery: {query}"}
             ]
         }
         response = await self.gpt.invoke(prompt)
@@ -386,7 +386,7 @@ class YandexAIServices:
         elapsed = time.time() - start_time
         self.metrics["avg_response_time"] = (self.metrics["avg_response_time"] * (self.metrics["requests"] - 1) + elapsed) / self.metrics["requests"]
         
-        return f"{_('Ответ')}: {response}\n{_('Настроение')}: {user_emotion:.2f}"
+        return f"Response: {response}\nSentiment: {user_emotion:.2f}"
 
 # GUI
 class NereMoreInterface(ctk.CTk):
@@ -398,17 +398,17 @@ class NereMoreInterface(ctk.CTk):
         self.services = YandexAIServices(self)
         self.interactive_behavior = InteractiveBehavior(self)
         
-        self.input_entry = ctk.CTkEntry(self, width=350, placeholder_text=_("Введите запрос..."))
+        self.input_entry = ctk.CTkEntry(self, width=350, placeholder_text="Enter query...")
         self.input_entry.pack(pady=5)
         self.input_entry.bind("<Return>", lambda e: asyncio.run(self.process_input()))
         
         self.results_text = ctk.CTkTextbox(self, width=580, height=200)
         self.results_text.pack(pady=5)
         
-        self.plot_button = ctk.CTkButton(self, text=_("Показать настроение"), command=self.plot_mood)
+        self.plot_button = ctk.CTkButton(self, text="Show mood trend", command=self.plot_mood)
         self.plot_button.pack(pady=5)
         
-        self.status_label = ctk.CTkLabel(self, text=_("Готов"))
+        self.status_label = ctk.CTkLabel(self, text="Ready")
         self.status_label.pack(pady=2)
         
         self.interactive_behavior.start()
@@ -432,11 +432,11 @@ class NereMoreInterface(ctk.CTk):
 
     def plot_mood(self):
         df = pd.DataFrame({"Mood": list(self.services.sentiment_analyzer.mood_history)})
-        fig = px.line(df, y="Mood", title=_("Тенденция настроения"))
+        fig = px.line(df, y="Mood", title="Mood Trend")
         fig.write_html("mood_trend.html")
         fig, ax = plt.subplots(figsize=(5, 3))
-        ax.plot(df["Mood"], label=_("Настроение"))
-        ax.set_title(_("Тенденция настроения"))
+        ax.plot(df["Mood"], label="Mood")
+        ax.set_title("Mood Trend")
         ax.legend()
         canvas = FigureCanvasTkAgg(fig, master=self)
         canvas.draw()
@@ -447,8 +447,8 @@ class InteractiveBehavior:
         self.gui = gui_interface
         self.last_interaction = time.time()
         self.sentiment_analyzer = SentimentAnalyzer()
-        self.greetings = [_("Привет!"), _("Здорово!"), _("Как дела?")]
-        self.questions = [_("Чем занимаешься?"), _("Что нового?")]
+        self.greetings = ["Hello!", "Hi there!", "How are you?"]
+        self.questions = ["What are you up to?", "What's new?"]
         self.is_running = False
         self.thread = None
 
@@ -473,7 +473,7 @@ class InteractiveBehavior:
         last_input = self.gui.input_entry.get().strip()
         if last_input:
             score = self.sentiment_analyzer.predict_sentiment_score(last_input)
-            greeting = random.choice(self.greetings) + (_(" Ты счастлив!") if score > 0.5 else _(" Не грусти!") if score < -0.5 else "")
+            greeting = random.choice(self.greetings) + (" You're happy!" if score > 0.5 else " Don't be sad!" if score < -0.5 else "")
             self.gui.display_response(greeting)
 
     def update_last_interaction(self):
@@ -505,7 +505,7 @@ class Config:
                 self.config = self.default_config
                 self._save_config()
         except Exception as e:
-            logging.error(f"Ошибка загрузки конфигурации: {e}")
+            logging.error(f"Error loading config: {e}")
             self.config = self.default_config
 
     def _save_config(self):
