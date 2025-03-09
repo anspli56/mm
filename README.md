@@ -53,6 +53,7 @@ except ImportError as e:
 # Импорты Fast.ai
 try:
     from fastai.text.all import *
+    from fastai.text.models import AWD_LSTM
 except ImportError as e:
     logging.error(f"Ошибка импорта fastai: {e}")
     print("Пожалуйста, установите Fast.ai: 'pip install fastai'")
@@ -66,45 +67,98 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# Класс для анализа текста с Fast.ai
+# Класс для анализа текста с Fast.ai (обновленный)
 class FastAITextAnalyzer:
-    def __init__(self):
+    def __init__(self, csv_path="sentiment_data.csv"):
+        self.csv_path = csv_path
         self.dls = None
         self.learn = None
         self._load_or_train_model()
 
     def _load_or_train_model(self):
-        """Загружаем или обучаем модель Fast.ai для анализа текста."""
+        """Загружаем или обучаем модель Fast.ai с реальными данными и предобученной моделью."""
         try:
             if os.path.exists("text_classifier.pth"):
                 self.learn = load_learner("text_classifier.pth")
                 logging.info("Загружена сохраненная модель Fast.ai")
             else:
-                data = pd.DataFrame({
-                    'text': ['хорошо', 'плохо', 'отлично', 'ужасно', 'нормально'],
-                    'label': ['positive', 'negative', 'positive', 'negative', 'neutral']
-                })
-                dls = TextDataLoaders.from_df(data, text_col='text', label_col='label', valid_pct=0.2)
-                self.learn = text_classifier_learner(dls, AWD_LSTM, drop_mult=0.5, metrics=accuracy)
-                self.learn.fit_one_cycle(1, 1e-2)
+                # Загружаем реальные данные из CSV
+                if os.path.exists(self.csv_path):
+                    data = pd.read_csv(self.csv_path)
+                    if 'text' not in data.columns or 'label' not in data.columns:
+                        raise ValueError("CSV должен содержать колонки 'text' и 'label'")
+                else:
+                    # Если CSV нет, создаем минимальный пример
+                    data = pd.DataFrame({
+                        'text': ['Я так рад!', 'Это ужасно', 'Мне грустно', 'Всё нормально', 'Я в гневе'],
+                        'label': ['радость', 'ужас', 'грусть', 'нейтральный', 'гнев']
+                    })
+                    data.to_csv(self.csv_path, index=False)
+                    logging.warning(f"Создан примерный файл {self.csv_path}. Замените его на свои данные.")
+
+                # Создаем DataLoaders для текста
+                dls = TextDataLoaders.from_df(
+                    data,
+                    text_col='text',
+                    label_col='label',
+                    valid_pct=0.2,
+                    text_vocab=None,  # Используем предобученный словарь позже
+                    is_lm=False  # Классификация, а не языковая модель
+                )
+
+                # Используем предобученную модель AWD_LSTM для русского языка
+                self.learn = text_classifier_learner(
+                    dls,
+                    AWD_LSTM,
+                    drop_mult=0.5,
+                    metrics=[accuracy],
+                    pretrained=True  # Включаем предобученные веса
+                )
+
+                # Загружаем предобученные веса (для русского языка нужно указать путь, если доступно)
+                # Пример: self.learn.load('path_to_russian_model') - нужно скачать отдельно
+                # Пока используем стандартные веса от Fast.ai и дообучаем
+                self.learn.fit_one_cycle(3, 1e-2)  # Обучаем на 3 эпохи
                 self.learn.export("text_classifier.pth")
-                logging.info("Создана и сохранена новая модель Fast.ai")
+                logging.info("Создана и сохранена новая модель Fast.ai с реальными данными")
             self.dls = self.learn.dls
         except Exception as e:
             logging.error(f"Ошибка инициализации Fast.ai модели: {e}")
             self.learn = None
 
     def predict_sentiment(self, text: str) -> Tuple[str, float]:
-        """Предсказываем настроение текста."""
+        """Предсказываем категорию настроения текста."""
         if not self.learn:
-            return "neutral", 0.0
+            return "нейтральный", 0.0
         try:
             pred, _, probs = self.learn.predict(text)
             confidence = float(max(probs))
             return pred, confidence
         except Exception as e:
             logging.error(f"Ошибка предсказания Fast.ai: {e}")
-            return "neutral", 0.0
+            return "нейтральный", 0.0
+
+    def predict_sentiment_score(self, text: str) -> float:
+        """Регрессия: числовая оценка настроения от -1 (негатив) до 1 (позитив)."""
+        if not self.learn:
+            return 0.0
+        try:
+            pred, _, probs = self.learn.predict(text)
+            # Пример маппинга категорий на числовые значения
+            sentiment_map = {
+                'радость': 1.0,
+                'отлично': 0.8,
+                'нейтральный': 0.0,
+                'грусть': -0.5,
+                'ужас': -0.8,
+                'гнев': -1.0
+            }
+            score = sentiment_map.get(pred, 0.0)
+            confidence = float(max(probs))
+            return score * confidence  # Учитываем уверенность модели
+        except Exception as e:
+            logging.error(f"Ошибка регрессии Fast.ai: {e}")
+            return 0.0
 
     def fine_tune(self, text: str, label: str):
         """Дообучаем модель на новом примере."""
@@ -117,6 +171,9 @@ class FastAITextAnalyzer:
             self.learn.fine_tune(1, base_lr=1e-3)
             self.learn.export("text_classifier.pth")
             logging.info(f"Модель Fast.ai дообучена на: {text} -> {label}")
+            # Обновляем CSV с новыми данными
+            with open(self.csv_path, 'a', encoding='utf-8') as f:
+                f.write(f'"{text}","{label}"\n')
         except Exception as e:
             logging.error(f"Ошибка дообучения Fast.ai: {e}")
 
@@ -691,17 +748,18 @@ class InteractiveBehavior:
         last_input = self.gui.input_entry.get().strip()
         if last_input:
             mood, confidence = self.text_analyzer.predict_sentiment(last_input)
-            self.user_mood = 1.0 if mood == 'positive' else -1.0 if mood == 'negative' else 0.0
-            logging.info(f"Fast.ai анализ: {last_input} -> {mood} (уверенность: {confidence:.2f})")
+            score = self.text_analyzer.predict_sentiment_score(last_input)
+            self.user_mood = score  # Используем числовую оценку
+            logging.info(f"Fast.ai анализ: {last_input} -> {mood} (уверенность: {confidence:.2f}, оценка: {score:.2f})")
             self.text_analyzer.fine_tune(last_input, mood)
 
         if time.time() - self.last_interaction > 60:
             question = random.choice(self.questions)
             self.gui.display_response(question)
         else:
-            if self.user_mood > 0.3:
-                greeting = random.choice(self.greetings) + " Ты выглядишь довольным!"
-            elif self.user_mood < -0.3:
+            if self.user_mood > 0.5:
+                greeting = random.choice(self.greetings) + " Ты выглядишь счастливым!"
+            elif self.user_mood < -0.5:
                 greeting = random.choice(self.greetings) + " Не грусти, давай что-нибудь сделаем!"
             else:
                 greeting = random.choice(self.greetings)
@@ -755,8 +813,8 @@ class YandexAIServices:
     def suggest_action_algorithm(self, query: str, user_emotion: Optional[float] = None) -> str:
         if user_emotion is None:
             mood, confidence = self.text_analyzer.predict_sentiment(query)
-            user_emotion = 1.0 if mood == 'positive' else -1.0 if mood == 'negative' else 0.0
-            logging.info(f"Fast.ai анализ запроса: {query} -> {mood} (уверенность: {confidence:.2f})")
+            user_emotion = self.text_analyzer.predict_sentiment_score(query)
+            logging.info(f"Fast.ai анализ запроса: {query} -> {mood} (уверенность: {confidence:.2f}, оценка: {user_emotion:.2f})")
             self.text_analyzer.fine_tune(query, mood)
 
         keywords = re.findall(r'\w+', query.lower())
@@ -765,15 +823,15 @@ class YandexAIServices:
         similar_entries = self.knowledge.get_similar(query, top_n=5)
         memory_context = "\n".join([f"[{s:.2f}] {r}" for _, r, s in similar_entries]) if similar_entries else "Нет схожих данных"
 
-        if user_emotion > 0.3:
-            tone = "оптимистичный"
-            suggestion = "Продолжайте задавать вопросы, я помогу вам с радостью!"
-        elif user_emotion < -0.3:
+        if user_emotion > 0.5:
+            tone = "радостный"
+            suggestion = "Продолжайте в том же духе, я с радостью помогу!"
+        elif user_emotion < -0.5:
             tone = "поддерживающий"
-            suggestion = "Не переживайте, я здесь, чтобы помочь разобраться!"
+            suggestion = "Не переживайте, я здесь, чтобы помочь!"
         else:
             tone = "нейтральный"
-            suggestion = "Давайте разберем ваш запрос шаг за шагом."
+            suggestion = "Давайте разберем ваш запрос вместе."
 
         built_context = self.knowledge.build_context(query)
         prompt = {
@@ -796,14 +854,16 @@ class YandexAIServices:
         }
         response = self.gpt.invoke(prompt)
         resp_mood, resp_confidence = self.text_analyzer.predict_sentiment(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f})")
+        resp_score = self.text_analyzer.predict_sentiment_score(response)
+        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})")
         self.knowledge.save(query, response, context=f"Эмоциональный тон: {tone}, Фокус: {main_focus}")
         return (
             f"Основной фокус: {main_focus}\n"
             f"Эмоциональный тон: {tone}\n"
+            f"Оценка настроения запроса: {user_emotion:.2f}\n"
             f"Предложение: {suggestion}\n"
             f"Ответ: {response}\n"
-            f"Настроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f})\n"
+            f"Настроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})\n"
             f"[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
         )
 
@@ -851,9 +911,10 @@ class YandexAIServices:
         }
         response = self.gpt.invoke(prompt)
         resp_mood, resp_confidence = self.text_analyzer.predict_sentiment(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f})")
+        resp_score = self.text_analyzer.predict_sentiment_score(response)
+        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})")
         self.knowledge.save(query, response, context=built_context)
-        return f"{response}\n\nНастроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f})\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
+        return f"{response}\n\nНастроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
@@ -1026,7 +1087,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        self.display_response(f"Умения:\n- Генерация текста на основе опыта\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n- Обучение моделей\n- Визуализация данных\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
+        self.display_response(f"Умения:\n- Генерация текста с учетом эмоций\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n- Обучение моделей\n- Визуализация данных\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
