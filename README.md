@@ -32,6 +32,7 @@ import sys
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 import random
+import base64  # Добавлен для обработки bytes в JSON
 
 # Добавленные библиотеки для работы с Keras и визуализацией
 import pandas as pd
@@ -39,9 +40,13 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam, SGD
+try:
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense
+    from tensorflow.keras.optimizers import Adam, SGD
+except ImportError as e:
+    logging.error(f"Ошибка импорта tensorflow.keras: {e}")
+    print("Пожалуйста, установите TensorFlow: 'pip install tensorflow'")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +57,6 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# Временная реализация CodeEditorWindow для устранения ModuleNotFoundError
 class CodeEditorWindow(ctk.CTkToplevel):
     def __init__(self, parent, services):
         super().__init__(parent)
@@ -146,7 +150,6 @@ class Config:
                         self._save_config()
                         return
                     self.config = json.loads(content)
-                    # Используем dict.update() для совместимости с Python < 3.9
                     temp_config = self.default_config.copy()
                     temp_config.update(self.config)
                     self.config = temp_config
@@ -407,7 +410,11 @@ class KnowledgeBase:
                     n_samples = len(docs)
                     n_clusters = min(self.config["learning"]["cluster_size"], n_samples)
                     self.kmeans = MiniBatchKMeans(n_clusters=n_clusters)
-                    embeddings = [np.frombuffer(entry['embeddings'], dtype=np.float16) for entry in self.db.all() if 'embeddings' in entry]
+                    embeddings = []
+                    for entry in self.db.all():
+                        if 'embeddings' in entry:
+                            embeddings_bytes = base64.b64decode(entry['embeddings'])
+                            embeddings.append(np.frombuffer(embeddings_bytes, dtype=np.float16))
                     if embeddings:
                         self.kmeans.fit(np.stack(embeddings))
                     self._save_state()
@@ -453,12 +460,13 @@ class KnowledgeBase:
             self._ensure_vectorizer_fitted(response)
             query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
             embeddings = self.vectorizer.transform([response]).toarray().astype(np.float16)[0]
+            embeddings_base64 = base64.b64encode(embeddings.tobytes()).decode('utf-8')
             entry = {
                 'id': str(uuid.uuid4()),
                 'query': query,
                 'response': response,
                 'context': context,
-                'embeddings': embeddings.tobytes(),
+                'embeddings': embeddings_base64,
                 'feedback': feedback,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'learning_rate': self.update_experience()
@@ -469,8 +477,12 @@ class KnowledgeBase:
     def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
         self._ensure_vectorizer_fitted(query)
         query_vec = self.vectorizer.transform([query]).toarray().astype(np.float16)[0]
-        all_data = [(entry['query'], entry['response'], np.frombuffer(entry['embeddings'], dtype=np.float16))
-                    for entry in self.db.all() if 'embeddings' in entry]
+        all_data = []
+        for entry in self.db.all():
+            if 'embeddings' in entry:
+                embeddings_bytes = base64.b64decode(entry['embeddings'])
+                embeddings_array = np.frombuffer(embeddings_bytes, dtype=np.float16)
+                all_data.append((entry['query'], entry['response'], embeddings_array))
         if not all_data:
             return []
         embeddings = np.stack([item[2] for item in all_data])
@@ -526,13 +538,11 @@ class DataModelTrainer:
         logging.info("Инициализация DataModelTrainer")
 
     def generate_synthetic_data(self, n_samples=1000):
-        """Генерация синтетических данных для примера."""
         X, y = make_classification(n_samples=n_samples, n_features=20, n_classes=2, random_state=42)
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         logging.info("Сгенерированы синтетические данные")
 
     def build_model(self, optimizer_name="Adam", learning_rate=0.001):
-        """Создание модели Keras."""
         self.model = Sequential([
             Dense(64, activation='relu', input_shape=(self.X_train.shape[1],)),
             Dense(32, activation='relu'),
@@ -548,7 +558,6 @@ class DataModelTrainer:
         logging.info(f"Модель создана с оптимизатором {optimizer_name} и learning_rate={learning_rate}")
 
     def train_model(self, epochs=50, batch_size=32):
-        """Обучение модели."""
         if self.model is None or self.X_train is None:
             raise ValueError("Модель или данные не инициализированы")
         
@@ -557,7 +566,6 @@ class DataModelTrainer:
         logging.info(f"Модель обучена: {epochs} эпох, размер батча {batch_size}")
 
     def visualize_results(self, output_path="training_results.png"):
-        """Визуализация результатов обучения с помощью Seaborn."""
         if self.history is None:
             logging.error("История обучения отсутствует")
             return
