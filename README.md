@@ -34,7 +34,7 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 import random
 import base64
-from gtts import gTTS  # Добавлен импорт gTTS
+from gtts import gTTS
 
 import pandas as pd
 import seaborn as sns
@@ -55,9 +55,18 @@ except ImportError as e:
 try:
     from fastai.text.all import *
     from fastai.text.models import AWD_LSTM
+    import torch
+    import torch.nn as nn
 except ImportError as e:
     logging.error(f"Ошибка импорта fastai: {e}")
     print("Пожалуйста, установите Fast.ai: 'pip install fastai'")
+
+# Импорты JAX
+import jax
+import jax.numpy as jnp
+from jax import jit, grad, vmap, random
+import optax
+from functools import partial
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +77,22 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# Класс для анализа текста с Fast.ai (регрессия)
+# Класс для анализа текста с Fast.ai (регрессия) с кастомным JAX слоем
+class JAXCustomLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        key = random.PRNGKey(42)
+        self.W = random.normal(key, (in_features, out_features)) * jnp.sqrt(2/in_features)
+        self.b = jnp.zeros(out_features)
+
+    def forward(self, x):
+        x = jnp.array(x.numpy())
+        out = jnp.dot(x, self.W) + self.b
+        out = jax.nn.relu(out)
+        return torch.tensor(out.copy())
+
 class FastAITextAnalyzer:
     def __init__(self, csv_path="sentiment_data.csv"):
         self.csv_path = csv_path
@@ -77,19 +101,16 @@ class FastAITextAnalyzer:
         self._load_or_train_model()
 
     def _load_or_train_model(self):
-        """Загружаем или обучаем регрессионную модель Fast.ai с реальными данными."""
         try:
             if os.path.exists("text_regressor.pth"):
                 self.learn = load_learner("text_regressor.pth")
                 logging.info("Загружена сохраненная регрессионная модель Fast.ai")
             else:
-                # Загружаем данные из CSV или создаем небольшой набор отзывов
                 if os.path.exists(self.csv_path):
                     data = pd.read_csv(self.csv_path)
                     if 'text' not in data.columns or 'score' not in data.columns:
                         raise ValueError("CSV должен содержать колонки 'text' и 'score' (от -1 до 1)")
                 else:
-                    # Небольшой набор данных с отзывами и числовыми оценками
                     data = pd.DataFrame({
                         'text': [
                             "Отличный сервис, я в восторге!",
@@ -108,7 +129,6 @@ class FastAITextAnalyzer:
                     data.to_csv(self.csv_path, index=False)
                     logging.warning(f"Создан примерный файл {self.csv_path}. Замените его на свои данные.")
 
-                # Создаем DataLoaders для регрессии
                 dls = TextDataLoaders.from_df(
                     data,
                     text_col='text',
@@ -118,37 +138,47 @@ class FastAITextAnalyzer:
                     is_lm=False
                 )
 
-                # Используем регрессионную модель
+                class JAXEnhancedModel(nn.Module):
+                    def __init__(self, arch):
+                        super().__init__()
+                        self.encoder = arch.encoder
+                        self.head = nn.Sequential(
+                            JAXCustomLayer(arch.encoder.output_dim, 128),
+                            nn.Linear(128, 1)
+                        )
+
+                    def forward(self, x):
+                        encoded = self.encoder(x)
+                        return self.head(encoded)
+
                 self.learn = text_learner(
                     dls,
                     AWD_LSTM,
                     drop_mult=0.5,
-                    metrics=[mae],  # Средняя абсолютная ошибка
-                    loss_func=MSELossFlat()  # Среднеквадратичная ошибка для регрессии
+                    metrics=[mae],
+                    loss_func=MSELossFlat()
                 )
 
-                # Дообучаем модель
+                self.learn.model = JAXEnhancedModel(self.learn.model)
                 self.learn.fit_one_cycle(3, 1e-2)
                 self.learn.export("text_regressor.pth")
-                logging.info("Создана и сохранена новая регрессионная модель Fast.ai")
+                logging.info("Создана и сохранена новая регрессионная модель Fast.ai с JAX")
             self.dls = self.learn.dls
         except Exception as e:
             logging.error(f"Ошибка инициализации Fast.ai модели: {e}")
             self.learn = None
 
     def predict_sentiment_score(self, text: str) -> float:
-        """Предсказываем числовую оценку настроения от -1 до 1."""
         if not self.learn:
             return 0.0
         try:
-            pred = self.learn.predict(text)[0].item()  # Получаем числовое предсказание
+            pred = self.learn.predict(text)[0].item()
             return float(pred)
         except Exception as e:
             logging.error(f"Ошибка предсказания Fast.ai: {e}")
             return 0.0
 
     def fine_tune(self, text: str, score: float):
-        """Дообучаем модель на новом примере."""
         if not self.learn:
             return
         try:
@@ -158,7 +188,6 @@ class FastAITextAnalyzer:
             self.learn.fine_tune(1, base_lr=1e-3)
             self.learn.export("text_regressor.pth")
             logging.info(f"Модель Fast.ai дообучена на: {text} -> {score:.2f}")
-            # Добавляем данные в CSV
             with open(self.csv_path, 'a', encoding='utf-8') as f:
                 f.write(f'"{text}",{score}\n')
         except Exception as e:
@@ -636,48 +665,148 @@ class KnowledgeBase:
 
 class DataModelTrainer:
     def __init__(self):
-        self.model = None
-        self.history = None
+        self.params = None
+        self.opt_state = None
+        self.history = {'loss': [], 'val_loss': [], 'accuracy': [], 'val_accuracy': []}
         self.X_train = None
         self.X_test = None
         self.y_train = None
         self.y_test = None
-        logging.info("Инициализация DataModelTrainer")
+        self.key = random.PRNGKey(42)
+        logging.info("Инициализация DataModelTrainer с JAX")
 
     def generate_synthetic_data(self, n_samples=1000):
         X, y = make_classification(n_samples=n_samples, n_features=20, n_classes=2, random_state=42)
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        logging.info("Сгенерированы синтетические данные")
+        self.X_train = jnp.array(self.X_train)
+        self.X_test = jnp.array(self.X_test)
+        self.y_train = jnp.array(self.y_train)
+        self.y_test = jnp.array(self.y_test)
+        logging.info("Сгенерированы синтетические данные для JAX")
+
+    def augment_data(self, X, noise_factor=0.1):
+        key = random.PRNGKey(int(time.time()))
+        noise = random.normal(key, X.shape) * noise_factor
+        return X + noise
+
+    def init_model(self, input_dim, hidden_dims=[64, 32], l2_lambda=0.01):
+        params = []
+        key = self.key
+        for i in range(len(hidden_dims) + 1):
+            in_dim = input_dim if i == 0 else hidden_dims[i-1]
+            out_dim = hidden_dims[i] if i < len(hidden_dims) else 1
+            key, subkey = random.split(key)
+            W = random.normal(subkey, (in_dim, out_dim)) * jnp.sqrt(2/in_dim)
+            b = jnp.zeros(out_dim)
+            scale = jnp.ones(out_dim)
+            shift = jnp.zeros(out_dim)
+            params.append({'W': W, 'b': b, 'scale': scale, 'shift': shift})
+        self.params = params
+        self.l2_lambda = l2_lambda
+
+    def batch_norm(self, x, scale, shift, eps=1e-5):
+        mean = jnp.mean(x, axis=0)
+        var = jnp.var(x, axis=0)
+        x_norm = (x - mean) / jnp.sqrt(var + eps)
+        return x_norm * scale + shift
+
+    @partial(jit, static_argnums=(0,))
+    def forward(self, params, x):
+        for i, layer in enumerate(params[:-1]):
+            x = jnp.dot(x, layer['W']) + layer['b']
+            x = self.batch_norm(x, layer['scale'], layer['shift'])
+            x = jax.nn.relu(x)
+        x = jnp.dot(x, params[-1]['W']) + params[-1]['b']
+        return jax.nn.sigmoid(x)
+
+    @partial(jit, static_argnums=(0,))
+    def loss_fn(self, params, X, y):
+        preds = self.forward(params, X)
+        bce_loss = -jnp.mean(y * jnp.log(preds + 1e-7) + (1 - y) * jnp.log(1 - preds + 1e-7))
+        l2_loss = self.l2_lambda * sum(jnp.sum(jnp.square(p['W'])) for p in params)
+        return bce_loss + l2_loss
+
+    def accuracy(self, params, X, y):
+        preds = self.forward(params, X)
+        return jnp.mean((preds > 0.5) == y)
 
     def build_model(self, optimizer_name="Adam", learning_rate=0.001):
-        self.model = Sequential([
-            Dense(64, activation='relu', input_shape=(self.X_train.shape[1],)),
-            Dense(32, activation='relu'),
-            Dense(1, activation='sigmoid')
-        ])
-        
         if optimizer_name == "Adam":
-            optimizer = Adam(learning_rate=learning_rate)
+            optimizer = optax.adam(learning_rate=learning_rate)
         else:
-            optimizer = SGD(learning_rate=learning_rate)
-        
-        self.model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
-        logging.info(f"Модель создана с оптимизатором {optimizer_name} и learning_rate={learning_rate}")
+            optimizer = optax.sgd(learning_rate=learning_rate)
+        self.opt_state = optimizer.init(self.params)
+        self.optimizer = optimizer
+        logging.info(f"Модель создана с JAX и оптимизатором {optimizer_name}")
 
     def train_model(self, epochs=50, batch_size=32):
-        if self.model is None or self.X_train is None:
+        if self.params is None or self.X_train is None:
             raise ValueError("Модель или данные не инициализированы")
-        
-        self.history = self.model.fit(self.X_train, self.y_train, epochs=epochs, batch_size=batch_size,
-                                      validation_data=(self.X_test, self.y_test), verbose=1)
-        logging.info(f"Модель обучена: {epochs} эпох, размер батча {batch_size}")
+
+        grad_loss = grad(self.loss_fn)
+        batched_loss_fn = vmap(self.loss_fn, in_axes=(None, 0, 0))
+        batched_forward = vmap(self.forward, in_axes=(None, 0))
+
+        num_batches = len(self.X_train) // batch_size
+        for epoch in range(epochs):
+            X_train_aug = self.augment_data(self.X_train)
+            
+            indices = jnp.arange(len(self.X_train))
+            self.key, subkey = random.split(self.key)
+            indices = random.permutation(subkey, indices)
+
+            epoch_loss = 0.0
+            for batch in range(num_batches):
+                batch_indices = indices[batch * batch_size:(batch + 1) * batch_size]
+                X_batch = X_train_aug[batch_indices]
+                y_batch = self.y_train[batch_indices]
+
+                grads = grad_loss(self.params, X_batch, y_batch)
+                updates, self.opt_state = self.optimizer.update(grads, self.opt_state)
+                self.params = optax.apply_updates(self.params, updates)
+
+                batch_loss = self.loss_fn(self.params, X_batch, y_batch)
+                epoch_loss += batch_loss
+
+            train_loss = epoch_loss / num_batches
+            val_loss = self.loss_fn(self.params, self.X_test, self.y_test)
+            train_acc = self.accuracy(self.params, self.X_train, self.y_train)
+            val_acc = self.accuracy(self.params, self.X_test, self.y_test)
+
+            self.history['loss'].append(float(train_loss))
+            self.history['val_loss'].append(float(val_loss))
+            self.history['accuracy'].append(float(train_acc))
+            self.history['val_accuracy'].append(float(val_acc))
+
+            logging.info(f"Эпоха {epoch+1}/{epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
+                        f"train_acc={train_acc:.4f}, val_acc={val_acc:.4f}")
+
+    def hyperparameter_tuning(self, learning_rates=[1e-3, 1e-2], batch_sizes=[16, 32], epochs=50):
+        best_params = None
+        best_val_acc = 0.0
+        results = []
+
+        for lr in learning_rates:
+            for bs in batch_sizes:
+                logging.info(f"Тестирование lr={lr}, batch_size={bs}")
+                self.init_model(input_dim=self.X_train.shape[1])
+                self.build_model(learning_rate=lr)
+                self.train_model(epochs=epochs, batch_size=bs)
+                val_acc = self.history['val_accuracy'][-1]
+                results.append({'lr': lr, 'batch_size': bs, 'val_acc': val_acc})
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_params = {'lr': lr, 'batch_size': bs}
+
+        logging.info(f"Лучшие параметры: lr={best_params['lr']}, batch_size={best_params['batch_size']}, val_acc={best_val_acc:.4f}")
+        return best_params
 
     def visualize_results(self, output_path="training_results.png"):
-        if self.history is None:
+        if not self.history['loss']:
             logging.error("История обучения отсутствует")
             return
 
-        history_df = pd.DataFrame(self.history.history)
+        history_df = pd.DataFrame(self.history)
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
         sns.lineplot(data=history_df[['loss', 'val_loss']])
@@ -788,10 +917,13 @@ class YandexAIServices:
     def train_and_visualize(self, epochs=50, batch_size=32, optimizer_name="Adam", learning_rate=0.001):
         try:
             self.data_trainer.generate_synthetic_data()
-            self.data_trainer.build_model(optimizer_name=optimizer_name, learning_rate=learning_rate)
-            self.data_trainer.train_model(epochs=epochs, batch_size=batch_size)
+            self.data_trainer.init_model(input_dim=self.data_trainer.X_train.shape[1])
+            best_params = self.data_trainer.hyperparameter_tuning()
+            self.data_trainer.build_model(optimizer_name=optimizer_name, learning_rate=best_params['lr'])
+            self.data_trainer.train_model(epochs=epochs, batch_size=best_params['batch_size'])
             self.data_trainer.visualize_results()
-            return f"Модель обучена! Графики сохранены в training_results.png\nОпыт ИИ: {self.knowledge.learning_rate:.1f}%"
+            return (f"Модель обучена с JAX! Лучшие параметры: lr={best_params['lr']}, batch_size={best_params['batch_size']}\n"
+                    f"Графики сохранены в training_results.png\nОпыт ИИ: {self.knowledge.learning_rate:.1f}%")
         except Exception as e:
             logging.error(f"Ошибка при обучении модели: {e}")
             return f"Ошибка при обучении: {str(e)}"
@@ -1070,7 +1202,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        self.display_response(f"Умения:\n- Генерация текста с учетом эмоций\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n- Обучение моделей\n- Визуализация данных\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
+        self.display_response(f"Умения:\n- Генерация текста с учетом эмоций\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n- Обучение моделей с JAX\n- Визуализация данных\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
