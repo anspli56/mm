@@ -17,11 +17,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import plotly.express as px
 from pydantic import BaseModel, ValidationError
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, WhisperForConditionalGeneration, CLIPProcessor, CLIPModel
 from tensorflow.keras.mixed_precision import set_global_policy
 import aiohttp
 import requests
+import pinecone
 from typing import Dict, Any, List, Tuple, Optional
 import time
 import uuid
@@ -29,9 +31,16 @@ import black
 import random
 from cryptography.fernet import Fernet
 from bs4 import BeautifulSoup
+import gettext
+from graphene import ObjectType, String, Schema
+import unittest
+import cupy as cp
 
 # Placeholder for Horovod (requires MPI setup)
 # import horovod.tensorflow as hvd
+
+# Prometheus client (requires external setup)
+# from prometheus_client import Counter, Histogram, start_http_server
 
 # Logging configuration
 logging.basicConfig(
@@ -43,77 +52,108 @@ logging.basicConfig(
 # Enable mixed precision
 set_global_policy('mixed_float16')
 
+# Initialize Pinecone for vector database
+pinecone.init(api_key="your-pinecone-api-key", environment="us-west1-gcp")
+pinecone_index = pinecone.Index("knowledge-base")
+
+# Multi-language support
+ru = gettext.translation('base', localedir='locales', languages=['ru'], fallback=True)
+ru.install()
+_ = ru.gettext
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+# Prometheus metrics (placeholder)
+# REQUESTS = Counter('app_requests_total', 'Total number of requests')
+# RESPONSE_TIME = Histogram('app_response_time_seconds', 'Response time in seconds')
 
 # Error handling decorator
 def log_errors(func):
     @wraps(func)
     async def async_wrapper(*args, **kwargs):
         try:
-            return await func(*args, **kwargs)
+            # RESPONSE_TIME.observe(time.time())  # Start timer
+            result = await func(*args, **kwargs)
+            # RESPONSE_TIME.observe(time.time())  # End timer
+            return result
         except Exception as e:
             logging.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
             raise
     @wraps(func)
     def sync_wrapper(*args, **kwargs):
         try:
-            return func(*args, **kwargs)
+            # RESPONSE_TIME.observe(time.time())
+            result = func(*args, **kwargs)
+            # RESPONSE_TIME.observe(time.time())
+            return result
         except Exception as e:
             logging.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
             raise
     return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
-# Sentiment Analyzer with BERT
+# Sentiment Analyzer with BERT and Multimodal Support
 class SentimentAnalyzer:
-    def __init__(self, model_name="blanchefort/rubert-base-cased-sentiment"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.sentiment_pipeline = pipeline("sentiment-analysis", model=self.model, tokenizer=self.tokenizer)
+    def __init__(self, text_model="blanchefort/rubert-base-cased-sentiment", audio_model="openai/whisper-small"):
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_model)
+        self.text_model = AutoModelForSequenceClassification.from_pretrained(text_model)
+        self.text_pipeline = pipeline("sentiment-analysis", model=self.text_model, tokenizer=self.text_tokenizer)
+        self.audio_model = WhisperForConditionalGeneration.from_pretrained(audio_model)
+        self.audio_processor = AutoTokenizer.from_pretrained(audio_model)
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         self.mood_history = deque(maxlen=50)
-        logging.info(f"SentimentAnalyzer initialized with {model_name}")
+        logging.info("SentimentAnalyzer initialized with BERT, Whisper, and CLIP")
 
     @lru_cache(maxsize=100)
     def predict_sentiment_score(self, text: str) -> float:
         if not isinstance(text, str) or not text.strip():
             return 0.0
-        result = self.sentiment_pipeline(text)[0]
+        result = self.text_pipeline(text)[0]
         label, score = result['label'], result['score']
         sentiment = score if label == 'POSITIVE' else -score if label == 'NEGATIVE' else 0.0
         self.mood_history.append(sentiment)
         return sentiment
 
+    async def predict_audio_sentiment(self, audio_path: str) -> float:
+        audio_input = self.audio_processor(audio_path, return_tensors="pt")
+        transcription = self.audio_model.generate(**audio_input)
+        text = self.audio_processor.decode(transcription[0], skip_special_tokens=True)
+        return self.predict_sentiment_score(text)
+
+    async def predict_image_sentiment(self, image_path: str, text_prompt: str) -> float:
+        inputs = self.clip_processor(text=[text_prompt], images=image_path, return_tensors="pt", padding=True)
+        outputs = self.clip_model(**inputs)
+        probs = outputs.logits_per_image.softmax(dim=1)
+        return float(probs[0][0])  # Simplified sentiment from image-text alignment
+
     def analyze_mood_trend(self) -> Dict[str, Any]:
         if not self.mood_history:
-            return {"current_mood": 0.0, "average_mood": 0.0, "trend": "нет данных"}
+            return {"current_mood": 0.0, "average_mood": 0.0, "trend": _("нет данных")}
         current_mood = self.mood_history[-1]
         average_mood = sum(self.mood_history) / len(self.mood_history)
-        trend = "недостаточно данных"
+        trend = _("недостаточно данных")
         if len(self.mood_history) >= 2:
             recent = list(self.mood_history)[-5:]
-            trend = "рост" if all(recent[i] <= recent[i+1] for i in range(len(recent)-1)) else "спад" if all(recent[i] >= recent[i+1] for i in range(len(recent)-1)) else "стабильное"
+            trend = _("рост") if all(recent[i] <= recent[i+1] for i in range(len(recent)-1)) else _("спад") if all(recent[i] >= recent[i+1] for i in range(len(recent)-1)) else _("стабильное")
         return {"current_mood": current_mood, "average_mood": average_mood, "trend": trend}
 
     def interpret_mood(self, mood_score: float) -> str:
-        return "позитивное" if mood_score > 0.5 else "негативное" if mood_score < -0.5 else "нейтральное"
+        return _("позитивное") if mood_score > 0.5 else _("негативное") if mood_score < -0.5 else _("нейтральное")
 
 # Input validation with Pydantic
 class UserInput(BaseModel):
     query: str
     context: Optional[str] = ""
+    media: Optional[str] = None  # For multimodal input (audio/image URL or path)
 
 def validate_folder_id(folder_id: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
 
 def fibonacci(n: int) -> int:
-    if n <= 1:
-        return n
-    a, b = 0, 1
-    for _ in range(2, n + 1):
-        a, b = b, a + b
-    return b
+    return cp.array([0, 1])[n] if n <= 1 else fibonacci(n-1) + fibonacci(n-2)  # Optimized with CuPy
 
-# SQLite-based Knowledge Base
+# Vector Database with Pinecone
 class KnowledgeBase:
     def __init__(self, services: 'YandexAIServices'):
         self.services = services
@@ -125,6 +165,8 @@ class KnowledgeBase:
         self.lock = threading.Lock()
         self.context_history = deque(maxlen=50)
         self.experience_level = self._get_experience_level()
+        self.vectorizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+        self.embed_model = AutoModelForSequenceClassification.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 
     def _get_experience_level(self) -> int:
         self.cursor.execute("SELECT COUNT(*) FROM knowledge")
@@ -132,56 +174,57 @@ class KnowledgeBase:
 
     def update_experience(self) -> float:
         self.experience_level += 1
-        fib_value = fibonacci(min(self.experience_level, 20))
-        learning_rate = min(100.0, fib_value * 0.5)
-        return learning_rate
+        return min(100.0, fibonacci(min(self.experience_level, 20)) * 0.5)
 
-    def save(self, query: str, response: str, context: str = ""):
+    async def save(self, query: str, response: str, context: str = ""):
         with self.lock:
             if len(response.strip()) < 5:
                 return
-            entry = (str(uuid.uuid4()), query, response, context, time.strftime('%Y-%m-%d %H:%M:%S'), self.update_experience())
+            entry_id = str(uuid.uuid4())
+            entry = (entry_id, query, response, context, time.strftime('%Y-%m-%d %H:%M:%S'), self.update_experience())
             self.cursor.execute("INSERT INTO knowledge VALUES (?, ?, ?, ?, ?, ?)", entry)
             self.conn.commit()
             self.context_history.append(f"Вопрос: {query}\nОтвет: {response}")
+            # Vectorize and upsert to Pinecone
+            inputs = self.vectorizer(query, return_tensors="pt")
+            embedding = self.embed_model(**inputs).logits.detach().numpy().flatten()[:384]  # Limit to Pinecone dim
+            pinecone_index.upsert([(entry_id, embedding.tolist())])
 
-    def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
-        self.cursor.execute("SELECT query, response FROM knowledge")
+    async def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
+        inputs = self.vectorizer(query, return_tensors="pt")
+        embedding = self.embed_model(**inputs).logits.detach().numpy().flatten()[:384]
+        results = pinecone_index.query(embedding.tolist(), top_k=top_n, include_metadata=False)
+        similar_ids = [match["id"] for match in results["matches"]]
+        self.cursor.execute("SELECT query, response FROM knowledge WHERE id IN ({})".format(','.join('?'*len(similar_ids))), similar_ids)
         data = self.cursor.fetchall()
-        similarities = [(q, r, 1.0 if query.lower() in q.lower() else 0.5) for q, r in data]
-        return sorted(similarities, key=lambda x: x[2], reverse=True)[:top_n]
+        return [(q, r, s["score"]) for (q, r), s in zip(data, results["matches"])]
 
-    def save_web_content(self, url: str, query: str) -> bool:
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            text = soup.get_text(separator=' ', strip=True)
-            if text:
-                self.save(query, text, context=f"Извлечено с сайта: {url}")
-                return True
-            return False
-        except Exception as e:
-            logging.error(f"Ошибка извлечения с {url}: {e}")
-            return False
+    async def save_web_content(self, url: str, query: str) -> bool:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    soup = BeautifulSoup(await resp.text(), 'html.parser')
+                    text = soup.get_text(separator=' ', strip=True)
+                    if text:
+                        await self.save(query, text, context=f"Извлечено с сайта: {url}")
+                        return True
+        return False
 
-    def build_context(self, query: str) -> str:
-        similar = self.get_similar(query, 3)
-        context = "\n\n".join([f"Ранее: {q}\nОтвет: {r} (сходство: {s:.2f})" for q, r, s in similar]) or "Нет схожих данных"
+    async def build_context(self, query: str) -> str:
+        similar = await self.get_similar(query, 3)
+        context = "\n\n".join([f"Ранее: {q}\nОтвет: {r} (сходство: {s:.2f})" for q, r, s in similar]) or _("Нет схожих данных")
         history = "\n".join(list(self.context_history)[-5:])
-        return f"История:\n{history}\n\nПрошлый опыт:\n{context}"
+        return f"{_('История')}:\n{history}\n\n{_('Прошлый опыт')}:\n{context}"
 
-# Asynchronous YandexGPT
+# Asynchronous YandexGPT with GraphQL-like structure
 class YandexGPT:
     def __init__(self, api_key: str, folder_id: str):
         self.api_key = api_key
         self.folder_id = folder_id
         self.url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         self.model = "yandexgpt-lite"
-        self.temperature = 0.6
-        self.max_tokens = 2000
         self.available = False
-        self.status = "Не проверено"
+        self.status = _("Не проверено")
 
     @log_errors
     async def check_availability(self) -> Tuple[bool, str]:
@@ -190,19 +233,29 @@ class YandexGPT:
             payload = {"modelUri": f"gpt://{self.folder_id}/{self.model}", "messages": [{"role": "user", "text": "Test"}]}
             async with session.post(self.url, headers=headers, json=payload) as resp:
                 self.available = resp.status == 200
-                self.status = "Доступно" if self.available else f"Ошибка: {resp.status}"
+                self.status = _("Доступно") if self.available else f"{_('Ошибка')}: {resp.status}"
                 return self.available, self.status
 
     @log_errors
     async def invoke(self, json_payload: Dict[str, Any]) -> str:
         if not self.available:
-            return f"API отключен: {self.status}"
+            return f"{_('API отключен')}: {self.status}"
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
             async with session.post(self.url, headers=headers, json=json_payload) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
                 return result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
+
+# GraphQL Schema (placeholder for future API expansion)
+class GPTQuery(ObjectType):
+    response = String(query=String(), context=String())
+
+    async def resolve_response(self, info, query, context=""):
+        services = info.context["services"]
+        return await services.generate_response(query, context)
+
+graphql_schema = Schema(query=GPTQuery)
 
 class Config:
     _instance = None
@@ -219,8 +272,7 @@ class Config:
 
     def _load_config(self):
         self.default_config = {
-            "yandex": {"keys": [{"id": "gpt_key_1", "value": "", "type": "gpt"}], "folder_id": ""},
-            "ui": {"animation_speed": 0.05, "max_context": 10}
+            "yandex": {"keys": [{"id": "gpt_key_1", "value": "", "type": "gpt"}], "folder_id": ""}
         }
         try:
             if os.path.exists("config.json"):
@@ -289,11 +341,11 @@ class CodeOptimizationModule:
     def detect_errors(self, code: str) -> List[str]:
         try:
             ast.parse(code)
-            return ["Ошибок не обнаружено"]
+            return [_("Ошибок не обнаружено")]
         except SyntaxError as e:
-            return [f"Синтаксическая ошибка: {str(e)}"]
+            return [f"{_('Синтаксическая ошибка')}: {str(e)}"]
 
-    def analyze_comments_with_flax(self, code: str) -> Dict[str, float]:
+    async def analyze_comments_with_flax(self, code: str) -> Dict[str, float]:
         comments = [line[line.find('#')+1:].strip() for line in code.split('\n') if '#' in line and line.strip().startswith('#')]
         return {comment: self.sentiment_analyzer.predict_sentiment_score(comment) for comment in comments if comment}
 
@@ -313,64 +365,66 @@ class YandexAIServices:
     async def initialize(self):
         available, status = await self.gpt.check_availability()
         if not available and self.gui_parent:
-            self.gui_parent.status_label.configure(text=f"Ошибка API: {status}")
+            self.gui_parent.status_label.configure(text=f"{_('Ошибка API')}: {status}")
+        # start_http_server(8000)  # Prometheus server (uncomment after setup)
 
     @log_errors
     async def generate_response(self, query: str, context: str = "") -> str:
         try:
             validated = UserInput(query=query, context=context)
         except ValidationError as e:
-            return f"Ошибка валидации: {e}"
+            return f"{_('Ошибка валидации')}: {e}"
         
+        # REQUESTS.inc()
         start_time = time.time()
         self.metrics["requests"] += 1
         urls = re.findall(r'https?://\S+', query)
         if urls:
-            success = self.knowledge.save_web_content(urls[0], query)
-            return f"Сохранено с {urls[0]}" if success else f"Ошибка с {urls[0]}"
+            success = await self.knowledge.save_web_content(urls[0], query)
+            return f"{_('Сохранено с')} {urls[0]}" if success else f"{_('Ошибка с')} {urls[0]}"
         
         if "код" in query.lower() or "code" in query.lower():
             purpose, location = self.code_optimizer.classify_code(query)
             errors = self.code_optimizer.detect_errors(query)
-            formatted_code = black.format_str(query, mode=black.FileMode()) if "Ошибка" not in errors[0] else query
-            sentiment_scores = self.code_optimizer.analyze_comments_with_flax(query)
-            comment_analysis = "\n".join([f"- '{c}' -> {self.sentiment_analyzer.interpret_mood(s)} ({s:.2f})" for c, s in sentiment_scores.items()]) or "Нет комментариев"
-            response = f"Код:\n{formatted_code}\nКлассификация: {purpose}, {location}\nОшибки: {chr(10).join(errors)}\nКомментарии:\n{comment_analysis}"
-            self.knowledge.save(query, response)
+            formatted_code = black.format_str(query, mode=black.FileMode()) if _("Ошибка") not in errors[0] else query
+            sentiment_scores = await self.code_optimizer.analyze_comments_with_flax(query)
+            comment_analysis = "\n".join([f"- '{c}' -> {self.sentiment_analyzer.interpret_mood(s)} ({s:.2f})" for c, s in sentiment_scores.items()]) or _("Нет комментариев")
+            response = f"{_('Код')}:\n{formatted_code}\n{_('Классификация')}: {purpose}, {location}\n{_('Ошибки')}: {chr(10).join(errors)}\n{_('Комментарии')}:\n{comment_analysis}"
+            await self.knowledge.save(query, response)
             return response
         
         user_emotion = self.sentiment_analyzer.predict_sentiment_score(query)
         mood_analysis = self.sentiment_analyzer.analyze_mood_trend()
-        tone = "радостный" if user_emotion > 0.5 else "поддерживающий" if user_emotion < -0.5 else "нейтральный"
-        built_context = self.knowledge.build_context(query)
+        tone = _("радостный") if user_emotion > 0.5 else _("поддерживающий") if user_emotion < -0.5 else _("нейтральный")
+        built_context = await self.knowledge.build_context(query)
         prompt = {
             "modelUri": f"gpt://{self.gpt.folder_id}/{self.gpt.model}",
             "completionOptions": {"temperature": 0.5, "maxTokens": 2000},
             "messages": [
-                {"role": "system", "text": f"Тон: {tone}, Опыт: {self.knowledge.experience_level}"},
-                {"role": "user", "text": f"Контекст: {built_context}\nЗапрос: {query}"}
+                {"role": "system", "text": f"{_('Тон')}: {tone}, {_('Опыт')}: {self.knowledge.experience_level}"},
+                {"role": "user", "text": f"{_('Контекст')}: {built_context}\n{_('Запрос')}: {query}"}
             ]
         }
         response = await self.gpt.invoke(prompt)
         resp_score = self.sentiment_analyzer.predict_sentiment_score(response)
-        self.knowledge.save(query, response, built_context)
+        await self.knowledge.save(query, response, built_context)
         elapsed = time.time() - start_time
         self.metrics["avg_response_time"] = (self.metrics["avg_response_time"] * (self.metrics["requests"] - 1) + elapsed) / self.metrics["requests"]
         
-        return (f"Ответ: {response}\n"
-                f"Настроение: {self.sentiment_analyzer.interpret_mood(user_emotion)} ({user_emotion:.2f})\n"
-                f"Оценка ответа: {resp_score:.2f}\n"
-                f"Тренд: {mood_analysis['trend']}\n"
-                f"Метрики: Запросов: {self.metrics['requests']}, Время: {self.metrics['avg_response_time']:.2f}с")
+        return (f"{_('Ответ')}: {response}\n"
+                f"{_('Настроение')}: {self.sentiment_analyzer.interpret_mood(user_emotion)} ({user_emotion:.2f})\n"
+                f"{_('Оценка ответа')}: {resp_score:.2f}\n"
+                f"{_('Тренд')}: {mood_analysis['trend']}\n"
+                f"{_('Метрики')}: {_('Запросов')}: {self.metrics['requests']}, {_('Время')}: {self.metrics['avg_response_time']:.2f}с")
 
 class InteractiveBehavior:
     def __init__(self, gui_interface):
         self.gui = gui_interface
         self.last_interaction = time.time()
         self.sentiment_analyzer = SentimentAnalyzer()
-        self.greetings = ["Привет!", "Здорово!", "Как дела?"]
-        self.questions = ["Чем занимаешься?", "Что нового?"]
-        self.suggestions = ["Давай проанализируем код?", "Хочешь обучить модель?"]
+        self.greetings = [_("Привет!"), _("Здорово!"), _("Как дела?")]
+        self.questions = [_("Чем занимаешься?"), _("Что нового?")]
+        self.suggestions = [_("Давай проанализируем код?"), _("Хочешь обучить модель?")]
         self.is_running = False
         self.thread = None
 
@@ -387,15 +441,15 @@ class InteractiveBehavior:
     def _interaction_loop(self):
         while self.is_running:
             if time.time() - self.last_interaction > 30:
-                self._interact_with_user()
+                asyncio.run(self._interact_with_user())
                 self.last_interaction = time.time()
             time.sleep(5)
 
-    def _interact_with_user(self):
+    async def _interact_with_user(self):
         last_input = self.gui.input_entry.get().strip()
         if last_input:
             score = self.sentiment_analyzer.predict_sentiment_score(last_input)
-            greeting = random.choice(self.greetings) + (" Ты счастлив!" if score > 0.5 else " Не грусти!" if score < -0.5 else "")
+            greeting = random.choice(self.greetings) + (_(" Ты счастлив!") if score > 0.5 else _(" Не грусти!") if score < -0.5 else "")
             suggestion = random.choice(self.suggestions)
             self.gui.display_response(f"{greeting}\n{suggestion}")
 
@@ -412,17 +466,17 @@ class NereMoreInterface(ctk.CTk):
         self.loop = asyncio.get_event_loop()
         self.interactive_behavior = InteractiveBehavior(self)
         
-        self.input_entry = ctk.CTkEntry(self, width=350, placeholder_text="Введите запрос...")
+        self.input_entry = ctk.CTkEntry(self, width=350, placeholder_text=_("Введите запрос..."))
         self.input_entry.pack(pady=5)
-        self.input_entry.bind("<Return>", lambda e: self.process_input())
+        self.input_entry.bind("<Return>", lambda e: asyncio.run(self.process_input()))
         
         self.results_text = ctk.CTkTextbox(self, width=580, height=200)
         self.results_text.pack(pady=5)
         
-        self.plot_button = ctk.CTkButton(self, text="Показать настроение", command=self.plot_mood)
+        self.plot_button = ctk.CTkButton(self, text=_("Показать настроение"), command=self.plot_mood)
         self.plot_button.pack(pady=5)
         
-        self.status_label = ctk.CTkLabel(self, text="Готов")
+        self.status_label = ctk.CTkLabel(self, text=_("Готов"))
         self.status_label.pack(pady=2)
         
         self.interactive_behavior.start()
@@ -437,23 +491,38 @@ class NereMoreInterface(ctk.CTk):
         self.results_text.delete("1.0", "end")
         self.results_text.insert("1.0", text)
 
-    def process_input(self):
+    async def process_input(self):
         self.interactive_behavior.update_last_interaction()
         query = self.input_entry.get().strip()
         if query:
-            response = self.loop.run_until_complete(self.services.generate_response(query))
+            response = await self.services.generate_response(query)
             self.display_response(response)
 
     def plot_mood(self):
+        df = pd.DataFrame({"Mood": list(self.services.sentiment_analyzer.mood_history)})
+        fig = px.line(df, y="Mood", title=_("Тенденция настроения"))
+        fig.write_html("mood_trend.html")
+        # For Tkinter integration, use static plot
         fig, ax = plt.subplots(figsize=(5, 3))
-        mood_history = list(self.services.sentiment_analyzer.mood_history)
-        ax.plot(mood_history, label="Настроение")
-        ax.set_title("Тенденция настроения")
+        ax.plot(df["Mood"], label=_("Настроение"))
+        ax.set_title(_("Тенденция настроения"))
         ax.legend()
         canvas = FigureCanvasTkAgg(fig, master=self)
         canvas.draw()
         canvas.get_tk_widget().pack(pady=5)
 
-if __name__ == "__main__":
+# Unit Tests
+class TestSentimentAnalyzer(unittest.TestCase):
+    def test_positive_sentiment(self):
+        analyzer = SentimentAnalyzer()
+        score = analyzer.predict_sentiment_score("Я счастлив!")
+        self.assertGreater(score, 0.5)
+
+async def main():
     app = NereMoreInterface()
     app.mainloop()
+
+if __name__ == "__main__":
+    # Uncomment to run tests
+    # unittest.main(exit=False)
+    asyncio.run(main())
