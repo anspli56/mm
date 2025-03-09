@@ -34,6 +34,7 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 import random
 import base64
+from gtts import gTTS
 
 import pandas as pd
 import seaborn as sns
