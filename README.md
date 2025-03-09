@@ -34,7 +34,7 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 import random
 import base64
-from gtts import gTTS
+from gtts import gTTS  # Добавлен импорт gTTS
 
 import pandas as pd
 import seaborn as sns
@@ -68,7 +68,7 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# Класс для анализа текста с Fast.ai (обновленный)
+# Класс для анализа текста с Fast.ai (регрессия)
 class FastAITextAnalyzer:
     def __init__(self, csv_path="sentiment_data.csv"):
         self.csv_path = csv_path
@@ -77,104 +77,90 @@ class FastAITextAnalyzer:
         self._load_or_train_model()
 
     def _load_or_train_model(self):
-        """Загружаем или обучаем модель Fast.ai с реальными данными и предобученной моделью."""
+        """Загружаем или обучаем регрессионную модель Fast.ai с реальными данными."""
         try:
-            if os.path.exists("text_classifier.pth"):
-                self.learn = load_learner("text_classifier.pth")
-                logging.info("Загружена сохраненная модель Fast.ai")
+            if os.path.exists("text_regressor.pth"):
+                self.learn = load_learner("text_regressor.pth")
+                logging.info("Загружена сохраненная регрессионная модель Fast.ai")
             else:
-                # Загружаем реальные данные из CSV
+                # Загружаем данные из CSV или создаем небольшой набор отзывов
                 if os.path.exists(self.csv_path):
                     data = pd.read_csv(self.csv_path)
-                    if 'text' not in data.columns or 'label' not in data.columns:
-                        raise ValueError("CSV должен содержать колонки 'text' и 'label'")
+                    if 'text' not in data.columns or 'score' not in data.columns:
+                        raise ValueError("CSV должен содержать колонки 'text' и 'score' (от -1 до 1)")
                 else:
-                    # Если CSV нет, создаем минимальный пример
+                    # Небольшой набор данных с отзывами и числовыми оценками
                     data = pd.DataFrame({
-                        'text': ['Я так рад!', 'Это ужасно', 'Мне грустно', 'Всё нормально', 'Я в гневе'],
-                        'label': ['радость', 'ужас', 'грусть', 'нейтральный', 'гнев']
+                        'text': [
+                            "Отличный сервис, я в восторге!",
+                            "Ужасное обслуживание, никогда не вернусь",
+                            "Всё нормально, ничего особенного",
+                            "Очень грустно от такого качества",
+                            "Злюсь на вашу доставку, это кошмар",
+                            "Прекрасный день благодаря вам",
+                            "Так себе, могло быть лучше",
+                            "Просто отвратительно",
+                            "Супер, всё идеально!",
+                            "Разочарован, ожидал большего"
+                        ],
+                        'score': [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
                     })
                     data.to_csv(self.csv_path, index=False)
                     logging.warning(f"Создан примерный файл {self.csv_path}. Замените его на свои данные.")
 
-                # Создаем DataLoaders для текста
+                # Создаем DataLoaders для регрессии
                 dls = TextDataLoaders.from_df(
                     data,
                     text_col='text',
-                    label_col='label',
+                    label_col='score',
                     valid_pct=0.2,
-                    text_vocab=None,  # Используем предобученный словарь позже
-                    is_lm=False  # Классификация, а не языковая модель
+                    text_vocab=None,
+                    is_lm=False
                 )
 
-                # Используем предобученную модель AWD_LSTM для русского языка
-                self.learn = text_classifier_learner(
+                # Используем регрессионную модель
+                self.learn = text_learner(
                     dls,
                     AWD_LSTM,
                     drop_mult=0.5,
-                    metrics=[accuracy],
-                    pretrained=True  # Включаем предобученные веса
+                    metrics=[mae],  # Средняя абсолютная ошибка
+                    loss_func=MSELossFlat()  # Среднеквадратичная ошибка для регрессии
                 )
 
-                # Загружаем предобученные веса (для русского языка нужно указать путь, если доступно)
-                # Пример: self.learn.load('path_to_russian_model') - нужно скачать отдельно
-                # Пока используем стандартные веса от Fast.ai и дообучаем
-                self.learn.fit_one_cycle(3, 1e-2)  # Обучаем на 3 эпохи
-                self.learn.export("text_classifier.pth")
-                logging.info("Создана и сохранена новая модель Fast.ai с реальными данными")
+                # Дообучаем модель
+                self.learn.fit_one_cycle(3, 1e-2)
+                self.learn.export("text_regressor.pth")
+                logging.info("Создана и сохранена новая регрессионная модель Fast.ai")
             self.dls = self.learn.dls
         except Exception as e:
             logging.error(f"Ошибка инициализации Fast.ai модели: {e}")
             self.learn = None
 
-    def predict_sentiment(self, text: str) -> Tuple[str, float]:
-        """Предсказываем категорию настроения текста."""
+    def predict_sentiment_score(self, text: str) -> float:
+        """Предсказываем числовую оценку настроения от -1 до 1."""
         if not self.learn:
-            return "нейтральный", 0.0
+            return 0.0
         try:
-            pred, _, probs = self.learn.predict(text)
-            confidence = float(max(probs))
-            return pred, confidence
+            pred = self.learn.predict(text)[0].item()  # Получаем числовое предсказание
+            return float(pred)
         except Exception as e:
             logging.error(f"Ошибка предсказания Fast.ai: {e}")
-            return "нейтральный", 0.0
-
-    def predict_sentiment_score(self, text: str) -> float:
-        """Регрессия: числовая оценка настроения от -1 (негатив) до 1 (позитив)."""
-        if not self.learn:
-            return 0.0
-        try:
-            pred, _, probs = self.learn.predict(text)
-            # Пример маппинга категорий на числовые значения
-            sentiment_map = {
-                'радость': 1.0,
-                'отлично': 0.8,
-                'нейтральный': 0.0,
-                'грусть': -0.5,
-                'ужас': -0.8,
-                'гнев': -1.0
-            }
-            score = sentiment_map.get(pred, 0.0)
-            confidence = float(max(probs))
-            return score * confidence  # Учитываем уверенность модели
-        except Exception as e:
-            logging.error(f"Ошибка регрессии Fast.ai: {e}")
             return 0.0
 
-    def fine_tune(self, text: str, label: str):
+    def fine_tune(self, text: str, score: float):
         """Дообучаем модель на новом примере."""
         if not self.learn:
             return
         try:
-            df = pd.DataFrame({'text': [text], 'label': [label]})
-            dls = TextDataLoaders.from_df(df, text_col='text', label_col='label', valid_pct=0)
+            df = pd.DataFrame({'text': [text], 'score': [score]})
+            dls = TextDataLoaders.from_df(df, text_col='text', label_col='score', valid_pct=0)
             self.learn.dls = dls
             self.learn.fine_tune(1, base_lr=1e-3)
-            self.learn.export("text_classifier.pth")
-            logging.info(f"Модель Fast.ai дообучена на: {text} -> {label}")
-            # Обновляем CSV с новыми данными
+            self.learn.export("text_regressor.pth")
+            logging.info(f"Модель Fast.ai дообучена на: {text} -> {score:.2f}")
+            # Добавляем данные в CSV
             with open(self.csv_path, 'a', encoding='utf-8') as f:
-                f.write(f'"{text}","{label}"\n')
+                f.write(f'"{text}",{score}\n')
         except Exception as e:
             logging.error(f"Ошибка дообучения Fast.ai: {e}")
 
@@ -748,11 +734,10 @@ class InteractiveBehavior:
     def _interact_with_user(self):
         last_input = self.gui.input_entry.get().strip()
         if last_input:
-            mood, confidence = self.text_analyzer.predict_sentiment(last_input)
             score = self.text_analyzer.predict_sentiment_score(last_input)
-            self.user_mood = score  # Используем числовую оценку
-            logging.info(f"Fast.ai анализ: {last_input} -> {mood} (уверенность: {confidence:.2f}, оценка: {score:.2f})")
-            self.text_analyzer.fine_tune(last_input, mood)
+            self.user_mood = score
+            logging.info(f"Fast.ai анализ: {last_input} -> оценка: {score:.2f}")
+            self.text_analyzer.fine_tune(last_input, score)
 
         if time.time() - self.last_interaction > 60:
             question = random.choice(self.questions)
@@ -813,10 +798,9 @@ class YandexAIServices:
 
     def suggest_action_algorithm(self, query: str, user_emotion: Optional[float] = None) -> str:
         if user_emotion is None:
-            mood, confidence = self.text_analyzer.predict_sentiment(query)
             user_emotion = self.text_analyzer.predict_sentiment_score(query)
-            logging.info(f"Fast.ai анализ запроса: {query} -> {mood} (уверенность: {confidence:.2f}, оценка: {user_emotion:.2f})")
-            self.text_analyzer.fine_tune(query, mood)
+            logging.info(f"Fast.ai анализ запроса: {query} -> оценка: {user_emotion:.2f}")
+            self.text_analyzer.fine_tune(query, user_emotion)
 
         keywords = re.findall(r'\w+', query.lower())
         main_focus = max(keywords, key=lambda w: len(w), default="запрос")
@@ -854,9 +838,8 @@ class YandexAIServices:
             ]
         }
         response = self.gpt.invoke(prompt)
-        resp_mood, resp_confidence = self.text_analyzer.predict_sentiment(response)
         resp_score = self.text_analyzer.predict_sentiment_score(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})")
+        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
         self.knowledge.save(query, response, context=f"Эмоциональный тон: {tone}, Фокус: {main_focus}")
         return (
             f"Основной фокус: {main_focus}\n"
@@ -864,7 +847,7 @@ class YandexAIServices:
             f"Оценка настроения запроса: {user_emotion:.2f}\n"
             f"Предложение: {suggestion}\n"
             f"Ответ: {response}\n"
-            f"Настроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})\n"
+            f"Оценка настроения ответа: {resp_score:.2f}\n"
             f"[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
         )
 
@@ -911,11 +894,10 @@ class YandexAIServices:
             ]
         }
         response = self.gpt.invoke(prompt)
-        resp_mood, resp_confidence = self.text_analyzer.predict_sentiment(response)
         resp_score = self.text_analyzer.predict_sentiment_score(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})")
+        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
         self.knowledge.save(query, response, context=built_context)
-        return f"{response}\n\nНастроение ответа: {resp_mood} (уверенность: {resp_confidence:.2f}, оценка: {resp_score:.2f})\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
+        return f"{response}\n\nОценка настроения ответа: {resp_score:.2f}\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
 
 class CodePasteWindow(ctk.CTkToplevel):
     def __init__(self, parent, callback):
