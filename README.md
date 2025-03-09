@@ -1,5 +1,5 @@
 import os
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Отключаем oneDNN для устранения сообщений TensorFlow
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 from collections import deque, OrderedDict
 import json
@@ -30,12 +30,9 @@ import black
 import requests
 import importlib.util
 import sys
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
 import random
 import base64
 from gtts import gTTS
-
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -51,16 +48,9 @@ except ImportError as e:
     logging.error(f"Ошибка импорта tensorflow.keras: {e}")
     print("Пожалуйста, установите TensorFlow: 'pip install tensorflow'")
 
-# Импорты Fast.ai
-try:
-    from fastai.text.all import TextDataLoaders, AWD_LSTM, text_learner, mae, MSELossFlat, load_learner
-    import torch
-    import torch.nn as nn
-except ImportError as e:
-    logging.error(f"Ошибка импорта fastai: {e}")
-    print("Пожалуйста, установите Fast.ai: 'pip install fastai'")
-
-# Импорты JAX
+# Импорты Flax и JAX
+import flax.linen as nn
+from flax.training import train_state
 import jax
 import jax.numpy as jnp
 from jax import jit, grad, vmap, random
@@ -76,88 +66,58 @@ logging.basicConfig(
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# Функции для работы с Fast.ai
-def train_fastai_model(csv_path="sentiment_data.csv", model_path="text_regressor.pth"):
-    """
-    Обучает модель Fast.ai для регрессии текста (например, анализа настроения).
-    Возвращает обученный объект learner или загружает существующий.
-    """
-    try:
-        if os.path.exists(model_path):
-            learner = load_learner(model_path)
-            logging.info("Загружена сохраненная регрессионная модель Fast.ai")
-            return learner
+# Модель на Flax для анализа настроений
+class SentimentFlaxModel(nn.Module):
+    hidden_dim: int = 128
+    dropout_rate: float = 0.3
 
-        if os.path.exists(csv_path):
-            data = pd.read_csv(csv_path)
-            if 'text' not in data.columns or 'score' not in data.columns:
-                logging.warning(f"CSV {csv_path} не содержит нужных колонок. Создается примерный набор.")
-                data = create_default_dataset(csv_path)
-            elif not data['score'].between(-1, 1).all():
-                logging.warning(f"Значения 'score' вне диапазона [-1, 1]. Создается примерный набор.")
-                data = create_default_dataset(csv_path)
-        else:
-            data = create_default_dataset(csv_path)
+    @nn.compact
+    def __call__(self, x, training: bool = False):
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(x)
+        x = nn.Dense(self.hidden_dim // 2)(x)
+        x = nn.relu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(x)
+        x = nn.Dense(1)(x)
+        x = nn.tanh(x)  # Ограничиваем выход в диапазон [-1, 1]
+        return x
 
-        dls = TextDataLoaders.from_df(
-            data,
-            text_col='text',
-            label_col='score',
-            valid_pct=0.2,
-            text_vocab=None,
-            is_lm=False
+# Класс для анализа настроений с использованием Flax/JAX
+class SentimentAnalyzer:
+    def __init__(self, vectorizer=None, model_path="sentiment_model.pkl"):
+        self.vectorizer = vectorizer if vectorizer else TfidfVectorizer(max_features=5000)
+        self.model_path = model_path
+        self.rng = random.PRNGKey(42)
+        self.model = SentimentFlaxModel()
+        self.params = None
+        self.opt_state = None
+        self.optimizer = optax.adam(learning_rate=0.001)
+        self.mood_history = deque(maxlen=50)
+        self._init_model()
+        self._load_or_train_model()
+
+    def _init_model(self):
+        dummy_input = jnp.zeros((1, 5000))
+        self.params = self.model.init(self.rng, dummy_input, training=False)['params']
+        self.state = train_state.TrainState.create(
+            apply_fn=self.model.apply,
+            params=self.params,
+            tx=self.optimizer
         )
 
-        class JAXCustomLayer(nn.Module):
-            def __init__(self, in_features, out_features):
-                super().__init__()
-                self.in_features = in_features
-                self.out_features = out_features
-                key = random.PRNGKey(42)
-                self.W = random.normal(key, (in_features, out_features)) * jnp.sqrt(2/in_features)
-                self.b = jnp.zeros(out_features)
+    def _loss_fn(self, params, batch_x, batch_y):
+        preds = self.model.apply({'params': params}, batch_x, training=True, rngs={'dropout': random.PRNGKey(0)})
+        loss = jnp.mean((preds - batch_y) ** 2)  # MSE Loss
+        return loss
 
-            def forward(self, x):
-                x = jnp.array(x.numpy())
-                out = jnp.dot(x, self.W) + self.b
-                out = jax.nn.relu(out)
-                return torch.tensor(out.copy())
+    def _train_step(self, state, batch_x, batch_y):
+        loss, grads = jax.value_and_grad(self._loss_fn)(state.params, batch_x, batch_y)
+        state = state.apply_gradients(grads=grads)
+        return state, loss
 
-        class JAXEnhancedModel(nn.Module):
-            def __init__(self, arch):
-                super().__init__()
-                self.encoder = arch.encoder
-                self.head = nn.Sequential(
-                    JAXCustomLayer(arch.encoder.output_dim, 128),
-                    nn.Linear(128, 1)
-                )
-
-            def forward(self, x):
-                encoded = self.encoder(x)
-                return self.head(encoded)
-
-        learner = text_learner(
-            dls,
-            AWD_LSTM,
-            drop_mult=0.5,
-            metrics=[mae],
-            loss_func=MSELossFlat()
-        )
-
-        learner.model = JAXEnhancedModel(learner.model)
-        learner.fit_one_cycle(3, 1e-2)
-        learner.export(model_path)
-        logging.info("Создана и сохранена новая регрессионная модель Fast.ai с JAX")
-        return learner
-
-    except Exception as e:
-        logging.error(f"Ошибка обучения Fast.ai модели: {e}")
-        return None
-
-def create_default_dataset(csv_path):
-    """Создает примерный набор данных для обучения Fast.ai."""
-    data = pd.DataFrame({
-        'text': [
+    def _load_or_train_model(self):
+        texts = [
             "Отличный сервис, я в восторге!",
             "Ужасное обслуживание, никогда не вернусь",
             "Всё нормально, ничего особенного",
@@ -168,75 +128,55 @@ def create_default_dataset(csv_path):
             "Просто отвратительно",
             "Супер, всё идеально!",
             "Разочарован, ожидал большего"
-        ],
-        'score': [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
-    })
-    data.to_csv(csv_path, index=False)
-    logging.warning(f"Создан примерный файл {csv_path}.")
-    return data
-
-def predict_with_fastai(learner, text: str) -> float:
-    """Предсказывает оценку настроения текста с помощью Fast.ai модели."""
-    if learner is None:
-        logging.error("Fast.ai модель не инициализирована")
-        return 0.0
-    try:
-        pred = learner.predict(text)[0].item()
-        return float(pred)
-    except Exception as e:
-        logging.error(f"Ошибка предсказания Fast.ai: {e}")
-        return 0.0
-
-class FastAITextAnalyzer:
-    def __init__(self, csv_path="sentiment_data.csv"):
-        self.csv_path = csv_path
-        self.dls = None
-        self.learn = None
-        self.mood_history = deque(maxlen=50)  # История настроений для анализа
-        self._load_or_train_model()
-
-    def _load_or_train_model(self):
-        self.learn = train_fastai_model(self.csv_path)
-        if self.learn:
-            self.dls = self.learn.dls
+        ]
+        scores = [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
+        X = self.vectorizer.fit_transform(texts).toarray()
+        y = jnp.array(scores).reshape(-1, 1)
+        n_samples = len(X)
+        indices = np.arange(n_samples)
+        np.random.shuffle(indices)
+        train_size = int(0.8 * n_samples)
+        train_idx, test_idx = indices[:train_size], indices[train_size:]
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        X_train, X_test = jnp.array(X_train), jnp.array(X_test)
+        y_train, y_test = jnp.array(y_train), jnp.array(y_test)
+        epochs = 100
+        batch_size = 4
+        num_batches = len(X_train) // batch_size
+        for epoch in range(epochs):
+            indices = np.arange(len(X_train))
+            np.random.shuffle(indices)
+            epoch_loss = 0.0
+            for batch in range(num_batches):
+                batch_idx = indices[batch * batch_size:(batch + 1) * batch_size]
+                batch_x = X_train[batch_idx]
+                batch_y = y_train[batch_idx]
+                self.state, loss = self._train_step(self.state, batch_x, batch_y)
+                epoch_loss += loss
+            if epoch % 20 == 0:
+                logging.info(f"Epoch {epoch}, Loss: {epoch_loss / num_batches:.4f}")
+        joblib.dump(self.state.params, self.model_path)
 
     def predict_sentiment_score(self, text: str) -> float:
-        if not self.learn:
+        if not isinstance(text, str) or not text.strip():
             return 0.0
         try:
-            pred = self.learn.predict(text)[0].item()
-            self.mood_history.append(pred)  # Сохраняем оценку в историю
-            return float(pred)
+            x = self.vectorizer.transform([text]).toarray()
+            x = jnp.array(x)
+            pred = self.model.apply({'params': self.state.params}, x, training=False)
+            score = float(pred[0, 0])
+            self.mood_history.append(score)
+            return score
         except Exception as e:
-            logging.error(f"Ошибка предсказания Fast.ai: {e}")
+            logging.error(f"Ошибка предсказания настроения: {e}")
             return 0.0
-
-    def fine_tune(self, text: str, score: float):
-        if not self.learn:
-            return
-        try:
-            df = pd.DataFrame({'text': [text], 'score': [score]})
-            dls = TextDataLoaders.from_df(df, text_col='text', label_col='score', valid_pct=0)
-            self.learn.dls = dls
-            self.learn.fine_tune(1, base_lr=1e-3)
-            self.learn.export("text_regressor.pth")
-            logging.info(f"Модель Fast.ai дообучена на: {text} -> {score:.2f}")
-            with open(self.csv_path, 'a', encoding='utf-8') as f:
-                f.write(f'"{text}",{score}\n')
-        except Exception as e:
-            logging.error(f"Ошибка дообучения Fast.ai: {e}")
 
     def analyze_mood_trend(self) -> Dict[str, Any]:
-        """
-        Анализирует тенденции настроения на основе истории.
-        Возвращает словарь с текущим настроением, средней оценкой и тенденцией.
-        """
         if not self.mood_history:
             return {"current_mood": 0.0, "average_mood": 0.0, "trend": "нет данных"}
-
         current_mood = self.mood_history[-1] if self.mood_history else 0.0
         average_mood = sum(self.mood_history) / len(self.mood_history)
-
         if len(self.mood_history) >= 2:
             recent_moods = list(self.mood_history)[-5:]
             if all(recent_moods[i] <= recent_moods[i+1] for i in range(len(recent_moods)-1)):
@@ -247,47 +187,15 @@ class FastAITextAnalyzer:
                 trend = "стабильное настроение"
         else:
             trend = "недостаточно данных для анализа тенденции"
-
-        return {
-            "current_mood": current_mood,
-            "average_mood": average_mood,
-            "trend": trend
-        }
+        return {"current_mood": current_mood, "average_mood": average_mood, "trend": trend}
 
     def interpret_mood(self, mood_score: float) -> str:
-        """Интерпретирует оценку настроения в текстовом виде."""
         if mood_score > 0.5:
             return "позитивное"
         elif mood_score < -0.5:
             return "негативное"
         else:
             return "нейтральное"
-
-class CodeEditorWindow(ctk.CTkToplevel):
-    def __init__(self, parent, services):
-        super().__init__(parent)
-        self.title("Редактор кода")
-        self.geometry("600x400")
-        self.services = services
-        self._init_ui()
-
-    def _init_ui(self):
-        self.code_textbox = ctk.CTkTextbox(self, width=580, height=300, fg_color="#2F3536", text_color="#FFFFFF")
-        self.code_textbox.pack(padx=10, pady=10)
-        ctk.CTkButton(self, text="Анализировать", command=self._analyze_code).pack(pady=5)
-
-    def _analyze_code(self):
-        code = self.code_textbox.get("1.0", "end-1c").strip()
-        if code:
-            purpose, location = self.services.code_optimizer.classify_code(code)
-            errors = self.services.code_optimizer.detect_errors(code)
-            sentiment_scores = self.services.code_optimizer.analyze_comments_with_fastai(code)
-            comment_analysis = "\n".join(
-                [f"- Комментарий '{comment}' -> настроение: {self.services.text_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
-                 for comment, score in sentiment_scores.items()]
-            ) if sentiment_scores else "Комментариев для анализа нет."
-            self.code_textbox.delete("1.0", "end")
-            self.code_textbox.insert("1.0", f"Код:\n{code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n{chr(10).join(errors)}\n\nАнализ настроения в комментариях:\n{comment_analysis}")
 
 def validate_folder_id(folder_id: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
@@ -383,16 +291,13 @@ class Config:
     def _validate_and_update_on_startup(self):
         api_key = self.get_key()
         folder_id = self.get_folder_id()
-        
         if not api_key or not folder_id:
             logging.info("API ключ или folder_id отсутствуют, используются значения по умолчанию")
             self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
             self.update_folder_id("b1g170pkl3ihbn8bc3kd")
             return
-            
         temp_gpt = YandexGPT(api_key, folder_id)
         available, status = temp_gpt.check_availability()
-        
         if not available:
             logging.warning(f"Сохраненные данные недействительны: {status}. Установка значений по умолчанию")
             self.update_api_key("gpt_key_1", "AQVNzHvgRbhMqf98hCeuO8ek88XTmHFnVJ3fKcmo")
@@ -414,11 +319,9 @@ class Config:
     def update_api_key(self, key_id: str, value: str) -> bool:
         temp_gpt = YandexGPT(value, self.get_folder_id())
         available, status = temp_gpt.check_availability()
-        
         if not available:
             logging.error(f"Новый API ключ недействителен: {status}")
             return False
-            
         encrypted_value = self._cipher.encrypt(value.encode()).decode()
         for key in self.config["yandex"]["keys"]:
             if key["id"] == key_id:
@@ -436,7 +339,6 @@ class Config:
         if not validate_folder_id(folder_id):
             logging.error("Недействительный folder_id")
             return False
-            
         api_key = self.get_key()
         if api_key:
             temp_gpt = YandexGPT(api_key, folder_id)
@@ -444,7 +346,6 @@ class Config:
             if not available:
                 logging.error(f"folder_id недействителен с текущим ключом: {status}")
                 return False
-                
         self.config["yandex"]["folder_id"] = folder_id
         self._save_config()
         return True
@@ -452,24 +353,16 @@ class Config:
 class CodeOptimizationModule:
     def __init__(self, config: Config):
         self.config = config.data["code_classification"]
-        self.fastai_learner = None
-
-    def _load_fastai_if_needed(self):
-        if self.fastai_learner is None:
-            logging.info("Загрузка Fast.ai модели для анализа кода")
-            self.fastai_learner = train_fastai_model()
+        self.sentiment_analyzer = SentimentAnalyzer()
 
     def classify_code(self, code: str) -> Tuple[str, str]:
         purpose_score = {p: 0 for p in self.config["purposes"]}
         tokens = re.findall(r'\w+', code.lower())
-        
         for purpose, keywords in self.config["keywords"].items():
             for keyword in keywords:
                 if keyword in tokens:
                     purpose_score[purpose] += 1
-        
         purpose = max(purpose_score, key=purpose_score.get, default="utility")
-        
         if "ctk" in code or "tkinter" in code:
             location = "GUI"
         elif "requests" in code or "socket" in code:
@@ -478,7 +371,6 @@ class CodeOptimizationModule:
             location = "knowledge"
         else:
             location = "core"
-        
         return purpose, location
 
     def detect_errors(self, code: str) -> List[str]:
@@ -489,11 +381,7 @@ class CodeOptimizationModule:
             errors.append(f"Синтаксическая ошибка: {str(e)}")
         return errors if errors else ["Ошибок не обнаружено"]
 
-    def analyze_comments_with_fastai(self, code: str) -> Dict[str, float]:
-        self._load_fastai_if_needed()
-        if self.fastai_learner is None:
-            return {}
-
+    def analyze_comments_with_flax(self, code: str) -> Dict[str, float]:
         comments = []
         lines = code.split('\n')
         for line in lines:
@@ -506,13 +394,11 @@ class CodeOptimizationModule:
                 comment = line[line.find('#')+1:].strip()
                 if comment:
                     comments.append(comment)
-
         sentiment_scores = {}
         for comment in comments:
-            score = predict_with_fastai(self.fastai_learner, comment)
+            score = self.sentiment_analyzer.predict_sentiment_score(comment)
             sentiment_scores[comment] = score
-            logging.info(f"Fast.ai анализ комментария: {comment} -> оценка: {score:.2f}")
-
+            logging.info(f"Flax/JAX анализ комментария: {comment} -> оценка: {score:.2f}")
         return sentiment_scores
 
     def suggest_structure(self, code: str, errors: List[str]) -> str:
@@ -522,33 +408,27 @@ class CodeOptimizationModule:
         except:
             suggestions.append("Исправьте синтаксическую ошибку для дальнейшего анализа.")
             return "\n".join(suggestions)
-        
         for error in errors:
             if "syntax" in error.lower():
                 suggestions.append("Исправьте синтаксическую ошибку (например, скобки, отступы).")
-        
         return "\n".join(suggestions) if suggestions else "Структура корректна."
 
     def duplicate_structure(self, code: str) -> str:
         tree = ast.parse(code)
         duplicated_code = []
-        
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
                 duplicated_code.append(ast.unparse(node))
-        
         return "\n\n".join(duplicated_code) if duplicated_code else code
 
     def suggest_integration_points(self, code: str, location: str) -> List[Tuple[str, str]]:
         integration_points = []
         tree = ast.parse(code)
-        
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
                 integration_points.append((node.name, f"Интеграция функции {node.name} в {location}"))
             elif isinstance(node, ast.ClassDef):
                 integration_points.append((node.name, f"Интеграция класса {node.name} в {location}"))
-        
         return integration_points
 
 class YandexGPT:
@@ -574,16 +454,10 @@ class YandexGPT:
 
     def check_availability(self) -> Tuple[bool, str]:
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Api-Key {self.api_key}"
-            }
+            headers = {"Content-Type": "application/json", "Authorization": f"Api-Key {self.api_key}"}
             payload = {
                 "modelUri": f"gpt://{self.folder_id}/{self.model}",
-                "completionOptions": {
-                    "maxTokens": self.max_tokens,
-                    "temperature": self.temperature
-                },
+                "completionOptions": {"maxTokens": self.max_tokens, "temperature": self.temperature},
                 "messages": [{"role": "user", "text": "Test"}]
             }
             response = requests.post(self.url, headers=headers, json=payload)
@@ -598,12 +472,8 @@ class YandexGPT:
     def invoke(self, json_payload: Dict[str, Any]) -> str:
         if not self.available:
             return f"API отключен: {self.status}"
-        
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Api-Key {self.api_key}"
-            }
+            headers = {"Content-Type": "application/json", "Authorization": f"Api-Key {self.api_key}"}
             response = requests.post(self.url, headers=headers, json=json_payload)
             response.raise_for_status()
             result = response.json()
@@ -838,47 +708,37 @@ class DataModelTrainer:
     def train_model(self, epochs=50, batch_size=32):
         if self.params is None or self.X_train is None:
             raise ValueError("Модель или данные не инициализированы")
-
         grad_loss = grad(self.loss_fn)
         num_batches = len(self.X_train) // batch_size
         for epoch in range(epochs):
             X_train_aug = self.augment_data(self.X_train)
-            
             indices = jnp.arange(len(self.X_train))
             self.key, subkey = random.split(self.key)
             indices = random.permutation(subkey, indices)
-
             epoch_loss = 0.0
             for batch in range(num_batches):
                 batch_indices = indices[batch * batch_size:(batch + 1) * batch_size]
                 X_batch = X_train_aug[batch_indices]
                 y_batch = self.y_train[batch_indices]
-
                 grads = grad_loss(self.params, X_batch, y_batch)
                 updates, self.opt_state = self.optimizer.update(grads, self.opt_state)
                 self.params = optax.apply_updates(self.params, updates)
-
                 batch_loss = self.loss_fn(self.params, X_batch, y_batch)
                 epoch_loss += batch_loss
-
             train_loss = epoch_loss / num_batches
             val_loss = self.loss_fn(self.params, self.X_test, self.y_test)
             train_acc = self.accuracy(self.params, self.X_train, self.y_train)
             val_acc = self.accuracy(self.params, self.X_test, self.y_test)
-
             self.history['loss'].append(float(train_loss))
             self.history['val_loss'].append(float(val_loss))
             self.history['accuracy'].append(float(train_acc))
             self.history['val_accuracy'].append(float(val_acc))
-
-            logging.info(f"Эпоха {epoch+1}/{epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
-                        f"train_acc={train_acc:.4f}, val_acc={val_acc:.4f}")
+            logging.info(f"Эпоха {epoch+1}/{epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, train_acc={train_acc:.4f}, val_acc={val_acc:.4f}")
 
     def hyperparameter_tuning(self, learning_rates=[1e-3, 1e-2], batch_sizes=[16, 32], epochs=50):
         best_params = None
         best_val_acc = 0.0
         results = []
-
         for lr in learning_rates:
             for bs in batch_sizes:
                 logging.info(f"Тестирование lr={lr}, batch_size={bs}")
@@ -890,7 +750,6 @@ class DataModelTrainer:
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_params = {'lr': lr, 'batch_size': bs}
-
         logging.info(f"Лучшие параметры: lr={best_params['lr']}, batch_size={best_params['batch_size']}, val_acc={best_val_acc:.4f}")
         return best_params
 
@@ -898,7 +757,6 @@ class DataModelTrainer:
         if not self.history['loss']:
             logging.error("История обучения отсутствует")
             return
-
         history_df = pd.DataFrame(self.history)
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
@@ -906,13 +764,11 @@ class DataModelTrainer:
         plt.title('Loss over Epochs')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-
         plt.subplot(1, 2, 2)
         sns.lineplot(data=history_df[['accuracy', 'val_accuracy']])
         plt.title('Accuracy over Epochs')
         plt.xlabel('Epoch')
         plt.ylabel('Accuracy')
-
         plt.tight_layout()
         plt.savefig(output_path)
         plt.close()
@@ -933,7 +789,7 @@ class InteractiveBehavior:
         ]
         self.is_running = False
         self.thread = None
-        self.text_analyzer = FastAITextAnalyzer()
+        self.sentiment_analyzer = SentimentAnalyzer()
 
     def start(self):
         self.is_running = True
@@ -956,11 +812,9 @@ class InteractiveBehavior:
     def _interact_with_user(self):
         last_input = self.gui.input_entry.get().strip()
         if last_input:
-            score = self.text_analyzer.predict_sentiment_score(last_input)
+            score = self.sentiment_analyzer.predict_sentiment_score(last_input)
             self.user_mood = score
-            logging.info(f"Fast.ai анализ: {last_input} -> оценка: {score:.2f}")
-            self.text_analyzer.fine_tune(last_input, score)
-
+            logging.info(f"Flax/JAX анализ: {last_input} -> оценка: {score:.2f}")
         if time.time() - self.last_interaction > 60:
             if not self.questions:
                 self.gui.display_response("Нет доступных вопросов.")
@@ -995,8 +849,7 @@ class YandexAIServices:
         self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
         self.code_optimizer = CodeOptimizationModule(self.config)
         self.data_trainer = DataModelTrainer()
-        self.text_analyzer = FastAITextAnalyzer()
-        
+        self.sentiment_analyzer = SentimentAnalyzer()
         available, status = self.gpt.check_availability()
         if not available:
             logging.warning(f"Инициализация с проблемой API: {status}")
@@ -1032,20 +885,15 @@ class YandexAIServices:
 
     def suggest_action_algorithm(self, query: str, user_emotion: Optional[float] = None) -> str:
         if user_emotion is None:
-            user_emotion = self.text_analyzer.predict_sentiment_score(query)
-            logging.info(f"Fast.ai анализ запроса: {query} -> оценка: {user_emotion:.2f}")
-            self.text_analyzer.fine_tune(query, user_emotion)
-
-        mood_analysis = self.text_analyzer.analyze_mood_trend()
-        mood_interpretation = self.text_analyzer.interpret_mood(user_emotion)
-        avg_mood_interpretation = self.text_analyzer.interpret_mood(mood_analysis["average_mood"])
-
+            user_emotion = self.sentiment_analyzer.predict_sentiment_score(query)
+            logging.info(f"Flax/JAX анализ запроса: {query} -> оценка: {user_emotion:.2f}")
+        mood_analysis = self.sentiment_analyzer.analyze_mood_trend()
+        mood_interpretation = self.sentiment_analyzer.interpret_mood(user_emotion)
+        avg_mood_interpretation = self.sentiment_analyzer.interpret_mood(mood_analysis["average_mood"])
         keywords = re.findall(r'\w+', query.lower())
         main_focus = max(keywords, key=lambda w: len(w), default="запрос")
-
         similar_entries = self.knowledge.get_similar(query, top_n=5)
         memory_context = "\n".join([f"[{s:.2f}] {r}" for _, r, s in similar_entries]) if similar_entries else "Нет схожих данных"
-
         if user_emotion > 0.5:
             tone = "радостный"
             suggestion = "Продолжайте в том же духе, я с радостью помогу!"
@@ -1055,43 +903,29 @@ class YandexAIServices:
         else:
             tone = "нейтральный"
             suggestion = "Давайте разберем ваш запрос вместе."
-
         if mood_analysis["trend"] == "спад настроения":
             suggestion += " Замечаю, что настроение немного ухудшилось, давайте попробуем что-то позитивное!"
         elif mood_analysis["trend"] == "рост настроения":
             suggestion += " Отлично, настроение улучшается, давайте продолжим!"
-
         built_context = self.knowledge.build_context(query)
         prompt = {
             "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": 0.5,
-                "maxTokens": 2000
-            },
+            "completionOptions": {"stream": False, "temperature": 0.5, "maxTokens": 2000},
             "messages": [
-                {
-                    "role": "system",
-                    "text": f"Ты ассистент с уровнем опыта {self.knowledge.learning_rate:.1f}%. Используй накопленные знания и адаптируйся к эмоциональному состоянию пользователя (тон: {tone})."
-                },
-                {
-                    "role": "user",
-                    "text": f"Контекст:\n{memory_context}\n\nЗапрос: {query}\n\nОсновной фокус: {main_focus}"
-                }
+                {"role": "system", "text": f"Ты ассистент с уровнем опыта {self.knowledge.learning_rate:.1f}%. Используй накопленные знания и адаптируйся к эмоциональному состоянию пользователя (тон: {tone})."},
+                {"role": "user", "text": f"Контекст:\n{memory_context}\n\nЗапрос: {query}\n\nОсновной фокус: {main_focus}"}
             ]
         }
         response = self.gpt.invoke(prompt)
-        resp_score = self.text_analyzer.predict_sentiment_score(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
+        resp_score = self.sentiment_analyzer.predict_sentiment_score(response)
+        logging.info(f"Flax/JAX анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
         self.knowledge.save(query, response, context=f"Эмоциональный тон: {tone}, Фокус: {main_focus}")
-
         mood_summary = (
             f"Анализ настроения:\n"
             f"- Текущее настроение по запросу: {mood_interpretation} (оценка: {user_emotion:.2f})\n"
             f"- Среднее настроение за сессию: {avg_mood_interpretation} (оценка: {mood_analysis['average_mood']:.2f})\n"
             f"- Тенденция настроения: {mood_analysis['trend']}\n"
         )
-
         return (
             f"Основной фокус: {main_focus}\n"
             f"Эмоциональный тон ответа: {tone}\n"
@@ -1105,82 +939,63 @@ class YandexAIServices:
     def generate_response(self, query: str, context: str = "") -> str:
         if not query:
             return "Ошибка: Запрос пуст"
-        
         if "код" not in query.lower() and "code" not in query.lower() and not re.findall(r'https?://\S+', query):
             return self.suggest_action_algorithm(query)
-        
         urls = re.findall(r'https?://\S+', query)
         if urls:
             success = self.knowledge.save_web_content(urls[0], query)
             return f"Сохранено с {urls[0]}\n[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]" if success else f"Ошибка с {urls[0]}"
-        
         if "код" in query.lower() or "code" in query.lower():
             try:
                 formatted_code = black.format_str(query, mode=black.FileMode())
                 purpose, location = self.code_optimizer.classify_code(query)
                 errors = self.code_optimizer.detect_errors(query)
-                sentiment_scores = self.code_optimizer.analyze_comments_with_fastai(query)
+                sentiment_scores = self.code_optimizer.analyze_comments_with_flax(query)
                 comment_analysis = "\n".join(
-                    [f"- Комментарий '{comment}' -> настроение: {self.text_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
+                    [f"- Комментарий '{comment}' -> настроение: {self.sentiment_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
                      for comment, score in sentiment_scores.items()]
                 ) if sentiment_scores else "Комментариев для анализа нет."
-
                 response = (f"Отформатированный код:\n{formatted_code}\n\n"
                             f"Классификация:\n- Назначение: {purpose}\n- Место: {location}\n\n"
                             f"Ошибки:\n{chr(10).join(errors)}\n\n"
                             f"Анализ настроения в комментариях:\n{comment_analysis}")
                 self.knowledge.save(query, response)
-                
-                user_emotion = self.text_analyzer.predict_sentiment_score(query)
-                mood_analysis = self.text_analyzer.analyze_mood_trend()
-                mood_interpretation = self.text_analyzer.interpret_mood(user_emotion)
-                avg_mood_interpretation = self.text_analyzer.interpret_mood(mood_analysis["average_mood"])
+                user_emotion = self.sentiment_analyzer.predict_sentiment_score(query)
+                mood_analysis = self.sentiment_analyzer.analyze_mood_trend()
+                mood_interpretation = self.sentiment_analyzer.interpret_mood(user_emotion)
+                avg_mood_interpretation = self.sentiment_analyzer.interpret_mood(mood_analysis["average_mood"])
                 mood_summary = (
                     f"Анализ настроения:\n"
                     f"- Текущее настроение по запросу: {mood_interpretation} (оценка: {user_emotion:.2f})\n"
                     f"- Среднее настроение за сессию: {avg_mood_interpretation} (оценка: {mood_analysis['average_mood']:.2f})\n"
                     f"- Тенденция настроения: {mood_analysis['trend']}\n"
                 )
-
                 return f"{response}\n\n{mood_summary}[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
             except Exception as e:
                 return f"Ошибка обработки кода: {e}"
-        
         built_context = self.knowledge.build_context(query)
         prompt = {
             "modelUri": f"gpt://{self.config.get_folder_id()}/{self.gpt.model}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": max(0.3, 0.6 - (self.knowledge.learning_rate / 200)),
-                "maxTokens": 2000
-            },
+            "completionOptions": {"stream": False, "temperature": max(0.3, 0.6 - (self.knowledge.learning_rate / 200)), "maxTokens": 2000},
             "messages": [
-                {
-                    "role": "system",
-                    "text": f"Ты ассистент, который учится на основе опыта (текущий уровень: {self.knowledge.learning_rate:.1f}%). Используй накопленные знания для логически последовательных ответов."
-                },
-                {
-                    "role": "user",
-                    "text": f"Контекст:\n{built_context}\n\nТекущий запрос: {query}"
-                }
+                {"role": "system", "text": f"Ты ассистент, который учится на основе опыта (текущий уровень: {self.knowledge.learning_rate:.1f}%). Используй накопленные знания для логически последовательных ответов."},
+                {"role": "user", "text": f"Контекст:\n{built_context}\n\nТекущий запрос: {query}"}
             ]
         }
         response = self.gpt.invoke(prompt)
-        resp_score = self.text_analyzer.predict_sentiment_score(response)
-        logging.info(f"Fast.ai анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
+        resp_score = self.sentiment_analyzer.predict_sentiment_score(response)
+        logging.info(f"Flax/JAX анализ ответа: {response[:50]}... -> оценка: {resp_score:.2f}")
         self.knowledge.save(query, response, context=built_context)
-
-        user_emotion = self.text_analyzer.predict_sentiment_score(query)
-        mood_analysis = self.text_analyzer.analyze_mood_trend()
-        mood_interpretation = self.text_analyzer.interpret_mood(user_emotion)
-        avg_mood_interpretation = self.text_analyzer.interpret_mood(mood_analysis["average_mood"])
+        user_emotion = self.sentiment_analyzer.predict_sentiment_score(query)
+        mood_analysis = self.sentiment_analyzer.analyze_mood_trend()
+        mood_interpretation = self.sentiment_analyzer.interpret_mood(user_emotion)
+        avg_mood_interpretation = self.sentiment_analyzer.interpret_mood(mood_analysis["average_mood"])
         mood_summary = (
             f"Анализ настроения:\n"
             f"- Текущее настроение по запросу: {mood_interpretation} (оценка: {user_emotion:.2f})\n"
             f"- Среднее настроение за сессию: {avg_mood_interpretation} (оценка: {mood_analysis['average_mood']:.2f})\n"
             f"- Тенденция настроения: {mood_analysis['trend']}\n"
         )
-
         return f"{response}\n\nОценка настроения ответа: {resp_score:.2f}\n{mood_summary}[Опыт ИИ: {self.knowledge.learning_rate:.1f}%]"
 
 class CodePasteWindow(ctk.CTkToplevel):
@@ -1195,10 +1010,8 @@ class CodePasteWindow(ctk.CTkToplevel):
         self.code_entry = ctk.CTkTextbox(self, width=380, height=200, fg_color="#1C2526", text_color="#FFFFFF", font=("Courier", 12))
         self.code_entry.pack(padx=10, pady=10, fill="both", expand=True)
         self.code_entry.insert("1.0", "# Вставьте код здесь\n")
-
         button_frame = ctk.CTkFrame(self, fg_color="#2F3536")
         button_frame.pack(fill="x", padx=10, pady=5)
-        
         ctk.CTkButton(button_frame, text="Вставить", command=self._paste_code, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Увеличить", command=self._enlarge_window, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
         ctk.CTkButton(button_frame, text="Уменьшить", command=self._shrink_window, fg_color="#1C2526", hover_color="#4A4A4A").pack(side="left", padx=5)
@@ -1219,6 +1032,32 @@ class CodePasteWindow(ctk.CTkToplevel):
         if current_width > 200 and current_height > 200:
             self.geometry(f"{current_width - 100}x{current_height - 100}")
 
+class CodeEditorWindow(ctk.CTkToplevel):
+    def __init__(self, parent, services):
+        super().__init__(parent)
+        self.title("Редактор кода")
+        self.geometry("600x400")
+        self.services = services
+        self._init_ui()
+
+    def _init_ui(self):
+        self.code_textbox = ctk.CTkTextbox(self, width=580, height=300, fg_color="#2F3536", text_color="#FFFFFF")
+        self.code_textbox.pack(padx=10, pady=10)
+        ctk.CTkButton(self, text="Анализировать", command=self._analyze_code).pack(pady=5)
+
+    def _analyze_code(self):
+        code = self.code_textbox.get("1.0", "end-1c").strip()
+        if code:
+            purpose, location = self.services.code_optimizer.classify_code(code)
+            errors = self.services.code_optimizer.detect_errors(code)
+            sentiment_scores = self.services.code_optimizer.analyze_comments_with_flax(code)
+            comment_analysis = "\n".join(
+                [f"- Комментарий '{comment}' -> настроение: {self.services.sentiment_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
+                 for comment, score in sentiment_scores.items()]
+            ) if sentiment_scores else "Комментариев для анализа нет."
+            self.code_textbox.delete("1.0", "end")
+            self.code_textbox.insert("1.0", f"Код:\n{code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}\n\nОшибки:\n{chr(10).join(errors)}\n\nАнализ настроения в комментариях:\n{comment_analysis}")
+
 class NereMoreInterface(ctk.CTk):
     def __init__(self):
         logging.info("Шаг 0: Начало инициализации NereMoreInterface")
@@ -1228,23 +1067,19 @@ class NereMoreInterface(ctk.CTk):
             self.geometry("600x450")
             self.configure(fg_color="#1C2526")
             self.initialized = False
-
             self.audio = AudioManager()
             self.services = YandexAIServices(self)
             self.config = Config()
             self.context = deque(maxlen=self.config.data["ui"]["max_context"] * 2)
             self.interactive_behavior = InteractiveBehavior(self)
-
             self.logo_label = ctk.CTkLabel(self, text="Nere More", font=("Arial", 20, "bold"), text_color="#FFFFFF")
             self.logo_label.pack(pady=10)
-
             self.input_frame = ctk.CTkFrame(self, fg_color="#2F3536", corner_radius=10)
             self.input_frame.pack(fill="x", padx=10, pady=5)
             self.input_entry = ctk.CTkEntry(self.input_frame, width=350, height=40, font=("Arial", 14),
                                             placeholder_text="Введите запрос...", fg_color="#1C2526", text_color="#FFFFFF")
             self.input_entry.pack(side="left", padx=10, pady=5)
             self.input_entry.bind("<Return>", lambda e: self.process_input_with_interaction())
-
             buttons = [
                 ("📋", lambda: CodePasteWindow(self, self._paste_text_callback), "Вставить"),
                 ("🧲", self._magnet_search, "Поиск"),
@@ -1259,10 +1094,8 @@ class NereMoreInterface(ctk.CTk):
                 btn = ctk.CTkButton(self.input_frame, text=text, width=40, height=40, fg_color="#1C2526", hover_color="#4A4A4A",
                                    text_color="#FFFFFF", command=cmd)
                 btn.pack(side="left", padx=5)
-
             self.results_text = ctk.CTkTextbox(self, width=580, height=300, fg_color="#2F3536", text_color="#FFFFFF")
             self.results_text.pack(padx=10, pady=5)
-
             self.button_frame = ctk.CTkFrame(self, fg_color="#2F3536")
             self.button_frame.pack(fill="x", padx=10, pady=5)
             compact_buttons = [
@@ -1279,13 +1112,10 @@ class NereMoreInterface(ctk.CTk):
                 btn = ctk.CTkButton(self.button_frame, text=text, width=30, height=30, fg_color="#1C2526", hover_color="#4A4A4A",
                                    text_color="#FFFFFF", command=cmd)
                 btn.pack(side="left", padx=2)
-
             self.status_label = ctk.CTkLabel(self, text="Инициализация...", font=("Arial", 10), text_color="#FFFFFF")
             self.status_label.pack(side="bottom", pady=2)
-
             available, status = self.services.check_api_key()
             self.status_label.configure(text=f"Статус API: {status}")
-
             self.protocol("WM_DELETE_WINDOW", self._on_closing)
             self.initialized = True
             self.status_label.configure(text=f"Готов [Опыт ИИ: {self.services.knowledge.learning_rate:.1f}%]")
@@ -1340,9 +1170,9 @@ class NereMoreInterface(ctk.CTk):
             purpose, location = self.services.code_optimizer.classify_code(content)
             errors = self.services.code_optimizer.detect_errors(content)
             formatted_code = black.format_str(content, mode=black.FileMode()) if not errors else content
-            sentiment_scores = self.services.code_optimizer.analyze_comments_with_fastai(content)
+            sentiment_scores = self.services.code_optimizer.analyze_comments_with_flax(content)
             comment_analysis = "\n".join(
-                [f"- Комментарий '{comment}' -> настроение: {self.services.text_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
+                [f"- Комментарий '{comment}' -> настроение: {self.services.sentiment_analyzer.interpret_mood(score)} (оценка: {score:.2f})"
                  for comment, score in sentiment_scores.items()]
             ) if sentiment_scores else "Комментариев для анализа нет."
             response = (f"Код вставлен:\n{formatted_code}\n\n"
@@ -1350,11 +1180,10 @@ class NereMoreInterface(ctk.CTk):
                         f"Ошибки:\n{chr(10).join(errors)}\n\n"
                         f"Анализ настроения в комментариях:\n{comment_analysis}")
             self.services.knowledge.save(f"Inserted code (ID: {uuid.uuid4().hex[:8]})", formatted_code)
-            
-            user_emotion = self.services.text_analyzer.predict_sentiment_score(content)
-            mood_analysis = self.services.text_analyzer.analyze_mood_trend()
-            mood_interpretation = self.services.text_analyzer.interpret_mood(user_emotion)
-            avg_mood_interpretation = self.services.text_analyzer.interpret_mood(mood_analysis["average_mood"])
+            user_emotion = self.services.sentiment_analyzer.predict_sentiment_score(content)
+            mood_analysis = self.services.sentiment_analyzer.analyze_mood_trend()
+            mood_interpretation = self.services.sentiment_analyzer.interpret_mood(user_emotion)
+            avg_mood_interpretation = self.services.sentiment_analyzer.interpret_mood(mood_analysis["average_mood"])
             mood_summary = (
                 f"Анализ настроения:\n"
                 f"- Текущее настроение по тексту: {mood_interpretation} (оценка: {user_emotion:.2f})\n"
@@ -1398,18 +1227,14 @@ class APISettingsWindow(ctk.CTkToplevel):
         self.key_entry = ctk.CTkEntry(self, width=150)
         self.key_entry.grid(row=0, column=1, padx=5, pady=5)
         self.key_entry.insert(0, self.config.get_key())
-
         ctk.CTkButton(self, text="📋 Вставить", command=self._paste_key,
                      width=80, fg_color="#1C2526", hover_color="#4A4A4A").grid(row=0, column=2, padx=5)
-
         ctk.CTkLabel(self, text="Folder ID:").grid(row=1, column=0, padx=5, pady=5)
         self.folder_entry = ctk.CTkEntry(self, width=150)
         self.folder_entry.grid(row=1, column=1, padx=5, pady=5)
         self.folder_entry.insert(0, self.config.get_folder_id())
-
         ctk.CTkButton(self, text="Сохранить", command=self._save_api_key,
                      fg_color="#1C2526", hover_color="#4A4A4A").grid(row=2, column=0, columnspan=3, pady=10)
-
         self.status_label = ctk.CTkLabel(self, text="")
         self.status_label.grid(row=3, column=0, columnspan=3, pady=5)
 
@@ -1428,19 +1253,15 @@ class APISettingsWindow(ctk.CTkToplevel):
     def _save_api_key(self):
         key = self.key_entry.get().strip()
         folder_id = self.folder_entry.get().strip()
-
         if not key or not folder_id:
             self.status_label.configure(text="Ошибка: Поля не могут быть пустыми")
             return
-
         if not validate_folder_id(folder_id):
             self.status_label.configure(text="Ошибка: folder_id должен быть 20 символов (буквы/цифры)")
             return
-
         temp_gpt = YandexGPT(key, folder_id)
         is_valid, status_message = temp_gpt.check_availability()
         self.status_label.configure(text=status_message)
-
         if is_valid:
             self.config.update_api_key("gpt_key_1", key)
             self.config.update_folder_id(folder_id)
@@ -1478,9 +1299,5 @@ class APIKeyCheckWindow(ctk.CTkToplevel):
             self.status_text.insert("1.0", f"Статус: {status}")
 
 if __name__ == "__main__":
-    try:
-        nltk.download('vader_lexicon', quiet=True)
-    except Exception as e:
-        logging.error(f"Ошибка загрузки nltk данных: {e}")
     app = NereMoreInterface()
     app.run()
