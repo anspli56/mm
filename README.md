@@ -51,10 +51,9 @@ except ImportError as e:
     logging.error(f"Ошибка импорта tensorflow.keras: {e}")
     print("Пожалуйста, установите TensorFlow: 'pip install tensorflow'")
 
-# Импорты Fast.ai
+# Импорты Fast.ai (используем конкретные импорты для избежания проблем с Pylance)
 try:
-    from fastai.text.all import *
-    from fastai.text.models import AWD_LSTM
+    from fastai.text.all import TextDataLoaders, AWD_LSTM, text_learner, mae, MSELossFlat, load_learner
     import torch
     import torch.nn as nn
 except ImportError as e:
@@ -108,26 +107,15 @@ class FastAITextAnalyzer:
             else:
                 if os.path.exists(self.csv_path):
                     data = pd.read_csv(self.csv_path)
+                    # Проверяем наличие необходимых колонок и корректность данных
                     if 'text' not in data.columns or 'score' not in data.columns:
-                        raise ValueError("CSV должен содержать колонки 'text' и 'score' (от -1 до 1)")
+                        logging.warning(f"CSV {self.csv_path} не содержит нужных колонок 'text' и 'score'. Используется набор данных по умолчанию.")
+                        data = self._create_default_dataset()
+                    elif not data['score'].between(-1, 1).all():
+                        logging.warning(f"Значения в колонке 'score' должны быть в диапазоне [-1, 1]. Используется набор данных по умолчанию.")
+                        data = self._create_default_dataset()
                 else:
-                    data = pd.DataFrame({
-                        'text': [
-                            "Отличный сервис, я в восторге!",
-                            "Ужасное обслуживание, никогда не вернусь",
-                            "Всё нормально, ничего особенного",
-                            "Очень грустно от такого качества",
-                            "Злюсь на вашу доставку, это кошмар",
-                            "Прекрасный день благодаря вам",
-                            "Так себе, могло быть лучше",
-                            "Просто отвратительно",
-                            "Супер, всё идеально!",
-                            "Разочарован, ожидал большего"
-                        ],
-                        'score': [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
-                    })
-                    data.to_csv(self.csv_path, index=False)
-                    logging.warning(f"Создан примерный файл {self.csv_path}. Замените его на свои данные.")
+                    data = self._create_default_dataset()
 
                 dls = TextDataLoaders.from_df(
                     data,
@@ -167,6 +155,26 @@ class FastAITextAnalyzer:
         except Exception as e:
             logging.error(f"Ошибка инициализации Fast.ai модели: {e}")
             self.learn = None
+
+    def _create_default_dataset(self):
+        data = pd.DataFrame({
+            'text': [
+                "Отличный сервис, я в восторге!",
+                "Ужасное обслуживание, никогда не вернусь",
+                "Всё нормально, ничего особенного",
+                "Очень грустно от такого качества",
+                "Злюсь на вашу доставку, это кошмар",
+                "Прекрасный день благодаря вам",
+                "Так себе, могло быть лучше",
+                "Просто отвратительно",
+                "Супер, всё идеально!",
+                "Разочарован, ожидал большего"
+            ],
+            'score': [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
+        })
+        data.to_csv(self.csv_path, index=False)
+        logging.warning(f"Создан примерный файл {self.csv_path}. Замените его на свои данные.")
+        return data
 
     def predict_sentiment_score(self, text: str) -> float:
         if not self.learn:
@@ -869,16 +877,25 @@ class InteractiveBehavior:
             self.text_analyzer.fine_tune(last_input, score)
 
         if time.time() - self.last_interaction > 60:
+            if not self.questions:  # Safety check
+                self.gui.display_response("Нет доступных вопросов.")
+                return
             question = random.choice(self.questions)
             self.gui.display_response(question)
         else:
+            if not self.greetings:  # Safety check
+                self.gui.display_response("Привет! Чем могу помочь?")
+                return
             if self.user_mood > 0.5:
                 greeting = random.choice(self.greetings) + " Ты выглядишь счастливым!"
             elif self.user_mood < -0.5:
                 greeting = random.choice(self.greetings) + " Не грусти, давай что-нибудь сделаем!"
             else:
                 greeting = random.choice(self.greetings)
-            suggestion = random.choice(self.suggestions)
+            if not self.suggestions:  # Safety check
+                suggestion = "Давай что-нибудь сделаем!"
+            else:
+                suggestion = random.choice(self.suggestions)
             self.gui.display_response(f"{greeting}\n{suggestion}")
 
     def update_last_interaction(self):
