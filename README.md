@@ -84,8 +84,9 @@ class SentimentFlaxModel(nn.Module):
         return x
 
 # Класс для анализа настроений с использованием Flax/JAX
+
 class SentimentAnalyzer:
-    def __init__(self, vectorizer=None, model_path="sentiment_model.pkl"):
+    def init(self, vectorizer=None, model_path="sentiment_model.pkl"):
         self.vectorizer = vectorizer if vectorizer else TfidfVectorizer(max_features=5000)
         self.model_path = model_path
         self.rng = random.PRNGKey(42)
@@ -94,11 +95,14 @@ class SentimentAnalyzer:
         self.opt_state = None
         self.optimizer = optax.adam(learning_rate=0.001)
         self.mood_history = deque(maxlen=50)
-        self._init_model()
-        self._load_or_train_model()
+        self.feature_size = None  # Будет определено после векторизации
+        self._load_or_train_model()  # Инициализация модели после тренировки
+        self._init_model()  # Инициализация после определения feature_size
 
     def _init_model(self):
-        dummy_input = jnp.zeros((1, 5000))
+        if self.feature_size is None:
+            raise ValueError("Feature size not determined. Train model first.")
+        dummy_input = jnp.zeros((1, self.feature_size))
         self.params = self.model.init(self.rng, dummy_input, training=False)['params']
         self.state = train_state.TrainState.create(
             apply_fn=self.model.apply,
@@ -130,8 +134,13 @@ class SentimentAnalyzer:
             "Разочарован, ожидал большего"
         ]
         scores = [1.0, -1.0, 0.0, -0.6, -0.9, 0.8, -0.2, -0.8, 1.0, -0.4]
+
+        # Векторизация текста
         X = self.vectorizer.fit_transform(texts).toarray()
+        self.feature_size = X.shape[1]  # Определяем размер признаков
         y = jnp.array(scores).reshape(-1, 1)
+
+        # Разделение на тренировочные и тестовые данные
         n_samples = len(X)
         indices = np.arange(n_samples)
         np.random.shuffle(indices)
@@ -139,11 +148,20 @@ class SentimentAnalyzer:
         train_idx, test_idx = indices[:train_size], indices[train_size:]
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
+
+        # Конвертация в JAX массивы
         X_train, X_test = jnp.array(X_train), jnp.array(X_test)
         y_train, y_test = jnp.array(y_train), jnp.array(y_test)
+
+        # Инициализация модели с правильным feature_size перед обучением
+        if self.params is None:
+            self._init_model()
+
+        # Обучение модели
         epochs = 100
         batch_size = 4
         num_batches = len(X_train) // batch_size
+
         for epoch in range(epochs):
             indices = np.arange(len(X_train))
             np.random.shuffle(indices)
@@ -156,13 +174,21 @@ class SentimentAnalyzer:
                 epoch_loss += loss
             if epoch % 20 == 0:
                 logging.info(f"Epoch {epoch}, Loss: {epoch_loss / num_batches:.4f}")
+
+        # Сохранение параметров
         joblib.dump(self.state.params, self.model_path)
 
-    def predict_sentiment_score(self, text: str) -> float:
+
+def predict_sentiment_score(self, text: str) -> float:
         if not isinstance(text, str) or not text.strip():
             return 0.0
         try:
             x = self.vectorizer.transform([text]).toarray()
+            # Приведение размера к feature_size
+            if x.shape[1] < self.feature_size:
+                x = np.pad(x, ((0, 0), (0, self.feature_size - x.shape[1])), mode='constant')
+            elif x.shape[1] > self.feature_size:
+                x = x[:, :self.feature_size]
             x = jnp.array(x)
             pred = self.model.apply({'params': self.state.params}, x, training=False)
             score = float(pred[0, 0])
@@ -172,7 +198,7 @@ class SentimentAnalyzer:
             logging.error(f"Ошибка предсказания настроения: {e}")
             return 0.0
 
-    def analyze_mood_trend(self) -> Dict[str, Any]:
+def analyze_mood_trend(self) -> Dict[str, Any]:
         if not self.mood_history:
             return {"current_mood": 0.0, "average_mood": 0.0, "trend": "нет данных"}
         current_mood = self.mood_history[-1] if self.mood_history else 0.0
@@ -189,13 +215,14 @@ class SentimentAnalyzer:
             trend = "недостаточно данных для анализа тенденции"
         return {"current_mood": current_mood, "average_mood": average_mood, "trend": trend}
 
-    def interpret_mood(self, mood_score: float) -> str:
+def interpret_mood(self, mood_score: float) -> str:
         if mood_score > 0.5:
             return "позитивное"
         elif mood_score < -0.5:
             return "негативное"
         else:
             return "нейтральное"
+
 
 def validate_folder_id(folder_id: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
