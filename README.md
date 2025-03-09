@@ -31,7 +31,17 @@ import importlib.util
 import sys
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
-from code_editor import CodeEditorWindow  # Строка 34: Импорт исправлен, если файл существует
+import random
+
+# Добавленные библиотеки для работы с Keras и визуализацией
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam, SGD
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +51,27 @@ logging.basicConfig(
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+# Временная реализация CodeEditorWindow для устранения ModuleNotFoundError
+class CodeEditorWindow(ctk.CTkToplevel):
+    def __init__(self, parent, services):
+        super().__init__(parent)
+        self.title("Редактор кода")
+        self.geometry("600x400")
+        self.services = services
+        self._init_ui()
+
+    def _init_ui(self):
+        self.code_textbox = ctk.CTkTextbox(self, width=580, height=300, fg_color="#2F3536", text_color="#FFFFFF")
+        self.code_textbox.pack(padx=10, pady=10)
+        ctk.CTkButton(self, text="Анализировать", command=self._analyze_code).pack(pady=5)
+
+    def _analyze_code(self):
+        code = self.code_textbox.get("1.0", "end-1c").strip()
+        if code:
+            purpose, location = self.services.code_optimizer.classify_code(code)
+            self.code_textbox.delete("1.0", "end")
+            self.code_textbox.insert("1.0", f"Код:\n{code}\n\nКлассификация:\n- Назначение: {purpose}\n- Место: {location}")
 
 def validate_folder_id(folder_id: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9]{20}$', folder_id))
@@ -65,7 +96,8 @@ class AudioManager:
                 time.sleep(0.1)
             pygame.mixer.music.stop()
             pygame.mixer.quit()
-            os.remove(filename)
+            if os.path.exists(filename):
+                os.remove(filename)
         except (pygame.error, OSError) as e:
             logging.error(f"Ошибка воспроизведения аудио: {e}")
 
@@ -114,7 +146,10 @@ class Config:
                         self._save_config()
                         return
                     self.config = json.loads(content)
-                    self.config = self.default_config | self.config
+                    # Используем dict.update() для совместимости с Python < 3.9
+                    temp_config = self.default_config.copy()
+                    temp_config.update(self.config)
+                    self.config = temp_config
             else:
                 self.config = self.default_config
                 self._save_config()
@@ -334,16 +369,12 @@ class YandexGPT:
                 "Content-Type": "application/json",
                 "Authorization": f"Api-Key {self.api_key}"
             }
-            
-            response = requests.post(self.url, headers=headers, json=json_payload)  # Строка 338: Исправлено
-            if response.status_code != 200:
-                return f"Ошибка: {response.status_code} {response.reason}"
-            
+            response = requests.post(self.url, headers=headers, json=json_payload)
+            response.raise_for_status()
             result = response.json()
             return result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
-                
-        except Exception as e:
-            logging.error(f"Ошибка Yandex GPT: {e}")
+        except requests.RequestException as e:
+            logging.error(f"Ошибка запроса к Yandex GPT: {e}")
             return f"Ошибка сети: {str(e)}"
 
 class KnowledgeBase:
@@ -484,6 +515,136 @@ class KnowledgeBase:
                 self.learning_rate = 0.0
             self._save_state()
 
+class DataModelTrainer:
+    def __init__(self):
+        self.model = None
+        self.history = None
+        self.X_train = None
+        self.X_test = None
+        self.y_train = None
+        self.y_test = None
+        logging.info("Инициализация DataModelTrainer")
+
+    def generate_synthetic_data(self, n_samples=1000):
+        """Генерация синтетических данных для примера."""
+        X, y = make_classification(n_samples=n_samples, n_features=20, n_classes=2, random_state=42)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        logging.info("Сгенерированы синтетические данные")
+
+    def build_model(self, optimizer_name="Adam", learning_rate=0.001):
+        """Создание модели Keras."""
+        self.model = Sequential([
+            Dense(64, activation='relu', input_shape=(self.X_train.shape[1],)),
+            Dense(32, activation='relu'),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        if optimizer_name == "Adam":
+            optimizer = Adam(learning_rate=learning_rate)
+        else:
+            optimizer = SGD(learning_rate=learning_rate)
+        
+        self.model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+        logging.info(f"Модель создана с оптимизатором {optimizer_name} и learning_rate={learning_rate}")
+
+    def train_model(self, epochs=50, batch_size=32):
+        """Обучение модели."""
+        if self.model is None or self.X_train is None:
+            raise ValueError("Модель или данные не инициализированы")
+        
+        self.history = self.model.fit(self.X_train, self.y_train, epochs=epochs, batch_size=batch_size,
+                                      validation_data=(self.X_test, self.y_test), verbose=1)
+        logging.info(f"Модель обучена: {epochs} эпох, размер батча {batch_size}")
+
+    def visualize_results(self, output_path="training_results.png"):
+        """Визуализация результатов обучения с помощью Seaborn."""
+        if self.history is None:
+            logging.error("История обучения отсутствует")
+            return
+
+        history_df = pd.DataFrame(self.history.history)
+
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        sns.lineplot(data=history_df[['loss', 'val_loss']])
+        plt.title('Loss over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+
+        plt.subplot(1, 2, 2)
+        sns.lineplot(data=history_df[['accuracy', 'val_accuracy']])
+        plt.title('Accuracy over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+        logging.info(f"Графики сохранены в {output_path}")
+
+class InteractiveBehavior:
+    def __init__(self, gui_interface):
+        self.gui = gui_interface
+        self.last_interaction = time.time()
+        self.user_mood = 0.0
+        self.greetings = ["Привет!", "Здорово!", "Как дела?"]
+        self.questions = [
+            "Чем занимаешься?",
+            "Почему молчишь?",
+            "Как у вас дела?",
+            "Что нового?"
+        ]
+        self.suggestions = [
+            "Может, обучим модель на новых данных?",
+            "Давай проанализируем какой-нибудь код?",
+            "Хочешь узнать что-то интересное?",
+            "Как насчет визуализации данных?"
+        ]
+        self.is_running = False
+        self.thread = None
+
+    def start(self):
+        self.is_running = True
+        self.thread = threading.Thread(target=self._interaction_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.is_running = False
+        if self.thread:
+            self.thread.join()
+
+    def _interaction_loop(self):
+        while self.is_running:
+            time_since_last = time.time() - self.last_interaction
+            if time_since_last > 30:
+                self._interact_with_user()
+                self.last_interaction = time.time()
+            time.sleep(5)
+
+    def _interact_with_user(self):
+        last_input = self.gui.input_entry.get().strip()
+        if last_input:
+            sia = SentimentIntensityAnalyzer()
+            sentiment = sia.polarity_scores(last_input)
+            self.user_mood = sentiment['compound']
+
+        if time.time() - self.last_interaction > 60:
+            question = random.choice(self.questions)
+            self.gui.display_response(question)
+        else:
+            if self.user_mood > 0.3:
+                greeting = random.choice(self.greetings) + " Ты выглядишь довольным!"
+            elif self.user_mood < -0.3:
+                greeting = random.choice(self.greetings) + " Не грусти, давай что-нибудь сделаем!"
+            else:
+                greeting = random.choice(self.greetings)
+
+            suggestion = random.choice(self.suggestions)
+            self.gui.display_response(f"{greeting}\n{suggestion}")
+
+    def update_last_interaction(self):
+        self.last_interaction = time.time()
+
 class YandexAIServices:
     def __init__(self, gui_parent=None):
         self.config = Config()
@@ -492,6 +653,7 @@ class YandexAIServices:
         self.knowledge = KnowledgeBase(self)
         self.gpt = YandexGPT(self.config.get_key(), self.config.get_folder_id())
         self.code_optimizer = CodeOptimizationModule(self.config)
+        self.data_trainer = DataModelTrainer()
         
         available, status = self.gpt.check_availability()
         if not available:
@@ -511,6 +673,17 @@ class YandexAIServices:
 
     def check_api_key(self) -> Tuple[bool, str]:
         return self.gpt.check_availability()
+
+    def train_and_visualize(self, epochs=50, batch_size=32, optimizer_name="Adam", learning_rate=0.001):
+        try:
+            self.data_trainer.generate_synthetic_data()
+            self.data_trainer.build_model(optimizer_name=optimizer_name, learning_rate=learning_rate)
+            self.data_trainer.train_model(epochs=epochs, batch_size=batch_size)
+            self.data_trainer.visualize_results()
+            return f"Модель обучена! Графики сохранены в training_results.png\nОпыт ИИ: {self.knowledge.learning_rate:.1f}%"
+        except Exception as e:
+            logging.error(f"Ошибка при обучении модели: {e}")
+            return f"Ошибка при обучении: {str(e)}"
 
     def suggest_action_algorithm(self, query: str, user_emotion: Optional[float] = None) -> str:
         if user_emotion is None:
@@ -659,6 +832,7 @@ class NereMoreInterface(ctk.CTk):
             self.services = YandexAIServices(self)
             self.config = Config()
             self.context = deque(maxlen=self.config.data["ui"]["max_context"] * 2)
+            self.interactive_behavior = InteractiveBehavior(self)
 
             self.logo_label = ctk.CTkLabel(self, text="Nere More", font=("Arial", 20, "bold"), text_color="#FFFFFF")
             self.logo_label.pack(pady=10)
@@ -668,7 +842,7 @@ class NereMoreInterface(ctk.CTk):
             self.input_entry = ctk.CTkEntry(self.input_frame, width=350, height=40, font=("Arial", 14),
                                             placeholder_text="Введите запрос...", fg_color="#1C2526", text_color="#FFFFFF")
             self.input_entry.pack(side="left", padx=10, pady=5)
-            self.input_entry.bind("<Return>", lambda e: self.process_input())
+            self.input_entry.bind("<Return>", lambda e: self.process_input_with_interaction())
 
             buttons = [
                 ("📋", lambda: CodePasteWindow(self, self._paste_text_callback), "Вставить"),
@@ -678,6 +852,7 @@ class NereMoreInterface(ctk.CTk):
                 ("⚙️", lambda: APISettingsWindow(self, self.config), "Настройки"),
                 ("🔑", lambda: APIKeyCheckWindow(self, self.services, self.config), "Проверка ключа"),
                 ("💻", lambda: CodeEditorWindow(self, self.services), "Редактор кода"),
+                ("📊", self.train_model, "Обучить модель"),
             ]
             for text, cmd, hover in buttons:
                 btn = ctk.CTkButton(self.input_frame, text=text, width=40, height=40, fg_color="#1C2526", hover_color="#4A4A4A",
@@ -697,6 +872,7 @@ class NereMoreInterface(ctk.CTk):
                 ("⚙️", lambda: APISettingsWindow(self, self.config), "Настройки"),
                 ("🔑", lambda: APIKeyCheckWindow(self, self.services, self.config), "Проверка"),
                 ("💻", lambda: CodeEditorWindow(self, self.services), "Редактор"),
+                ("📊", self.train_model, "Обучить"),
             ]
             for text, cmd, hover in compact_buttons:
                 btn = ctk.CTkButton(self.button_frame, text=text, width=30, height=30, fg_color="#1C2526", hover_color="#4A4A4A",
@@ -712,6 +888,7 @@ class NereMoreInterface(ctk.CTk):
             self.protocol("WM_DELETE_WINDOW", self._on_closing)
             self.initialized = True
             self.status_label.configure(text=f"Готов [Опыт ИИ: {self.services.knowledge.learning_rate:.1f}%]")
+            self.interactive_behavior.start()
         except Exception as e:
             logging.error(f"Критическая ошибка инициализации: {e}", exc_info=True)
             messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение: {e}")
@@ -719,6 +896,7 @@ class NereMoreInterface(ctk.CTk):
 
     def _on_closing(self):
         logging.info("Закрытие приложения")
+        self.interactive_behavior.stop()
         if pygame.mixer.get_init():
             pygame.mixer.quit()
         self.services.knowledge.db.close()
@@ -748,6 +926,14 @@ class NereMoreInterface(ctk.CTk):
             self.context.append({"role": "user", "content": query})
             self.context.append({"role": "assistant", "content": response})
 
+    def process_input_with_interaction(self):
+        self.interactive_behavior.update_last_interaction()
+        self.process_input()
+
+    def train_model(self):
+        response = self.services.train_and_visualize(epochs=50, batch_size=32, optimizer_name="Adam", learning_rate=0.001)
+        self.display_response(response)
+
     def _paste_text_callback(self, content):
         if "def" in content or "class" in content:
             purpose, location = self.services.code_optimizer.classify_code(content)
@@ -767,7 +953,7 @@ class NereMoreInterface(ctk.CTk):
             self.display_response("\n".join(f"[{s:.2f}] {q}: {r}" for q, r, s in similar) or "Нет данных")
 
     def show_skills(self):
-        self.display_response(f"Умения:\n- Генерация текста на основе опыта\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
+        self.display_response(f"Умения:\n- Генерация текста на основе опыта\n- Обработка кода\n- Работа с интернет-ресурсами\n- Обнаружение ошибок\n- Редактирование кода\n- Дублирование структуры\n- Инспекция кода\n- Обучение моделей\n- Визуализация данных\n\nТекущий уровень опыта: {self.services.knowledge.learning_rate:.1f}%")
 
     def _get_context(self) -> str:
         return "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.context)
@@ -872,6 +1058,9 @@ class APIKeyCheckWindow(ctk.CTkToplevel):
             self.status_text.insert("1.0", f"Статус: {status}")
 
 if __name__ == "__main__":
-    nltk.download('vader_lexicon', quiet=True)
+    try:
+        nltk.download('vader_lexicon', quiet=True)
+    except Exception as e:
+        logging.error(f"Ошибка загрузки nltk данных: {e}")
     app = NereMoreInterface()
     app.run()
