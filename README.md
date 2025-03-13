@@ -25,22 +25,13 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 from tensorflow.keras.mixed_precision import set_global_policy
 import aiohttp
 import requests
-import pinecone
+from pinecone import Pinecone
 from typing import Dict, Any, List, Tuple, Optional
 import time
 import uuid
-import black
 import random
 from cryptography.fernet import Fernet
 from bs4 import BeautifulSoup
-import gettext
-from graphene import ObjectType, String, Schema
-import onnxruntime as ort
-from optimum.onnxruntime import ORTQuantizer
-from optimum.onnxruntime.configuration import AutoQuantizationConfig
-import torch
-from torch_geometric.nn import GATConv
-import uvloop
 import heapq
 from sympy import symbols, simplify
 import mmap
@@ -49,9 +40,11 @@ from qiskit_aer import AerSimulator
 import jax
 import jax.numpy as jnp
 from jax import grad, jit, vmap
-
-# Placeholder for Rust extension
-# from rust_ext import optimize_code
+import torch
+from torch_geometric.nn import GATConv
+import onnxruntime as ort
+from optimum.onnxruntime import ORTQuantizer
+from optimum.onnxruntime.configuration import AutoQuantizationConfig
 
 # Logging configuration
 logging.basicConfig(
@@ -64,13 +57,11 @@ logging.basicConfig(
 set_global_policy('mixed_float16')
 
 # Initialize Pinecone
-pinecone.init(api_key="your-pinecone-api-key", environment="us-west1-gcp")
-pinecone_index = pinecone.Index("knowledge-base")
+pc = Pinecone(api_key="your-pinecone-api-key")
+pinecone_index = pc.Index("knowledge-base")
 
-# Multi-language support
-ru = gettext.translation('base', localedir='locales', languages=['ru'], fallback=True)
-ru.install()
-_ = ru.gettext
+# Multi-language support (ru translation placeholder)
+_ = lambda x: x  # Placeholder for gettext
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -117,15 +108,15 @@ class ContextGNN(torch.nn.Module):
         x = self.conv1(x, edge_index).relu()
         return self.conv2(x, edge_index)
 
-# Custom Event Loop
-class PriorityEventLoop(uvloop.Loop):
+# Custom Event Loop (Windows-compatible)
+class PriorityEventLoop:
     def __init__(self):
-        super().__init__()
+        self.loop = asyncio.get_event_loop()
         self._priority_queue = []
 
     def call_soon_threadsafe(self, callback, *args, priority=0):
         heapq.heappush(self._priority_queue, (priority, callback, args))
-        super().call_soon_threadsafe(self._run_prioritized)
+        self.loop.call_soon_threadsafe(self._run_prioritized)
 
     def _run_prioritized(self):
         while self._priority_queue:
@@ -201,7 +192,7 @@ class VectorSearchHandler(Handler):
             return cached
         vectorizer = OptimizedVectorizer()
         vector = await vectorizer.vectorize(query.filters["query"])
-        results = self.vector_db.query(vector.tolist(), top_k=5, include_metadata=False)
+        results = self.vector_db.query(vector=vector.tolist(), top_k=5, include_metadata=False)
         self.cache[cache_key] = results["matches"]
         return results["matches"]
 
@@ -231,11 +222,11 @@ class KnowledgeBase:
             self.conn.commit()
             vector = await self.vectorizer.vectorize(query)
             self.vectors = np.append(self.vectors, [vector], axis=0)
-            pinecone_index.upsert([(entry_id, vector.tolist())])
+            pinecone_index.upsert(vectors=[(entry_id, vector.tolist())])
 
     async def get_similar(self, query: str, top_n: int = 5) -> List[Tuple[str, str, float]]:
         vector = await self.vectorizer.vectorize(query)
-        results = pinecone_index.query(vector.tolist(), top_k=top_n, include_metadata=False)
+        results = pinecone_index.query(vector=vector.tolist(), top_k=top_n, include_metadata=False)
         similar_ids = [match["id"] for match in results["matches"]]
         self.cursor.execute("SELECT query, response FROM knowledge WHERE id IN ({})".format(','.join('?'*len(similar_ids))), similar_ids)
         data = self.cursor.fetchall()
@@ -268,7 +259,6 @@ class YandexGPT:
         self.available = False
         self.status = "Not checked"
 
-    @wraps
     async def check_availability(self) -> Tuple[bool, str]:
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
@@ -278,13 +268,12 @@ class YandexGPT:
                 self.status = "Available" if self.available else f"Error: {resp.status}"
                 return self.available, self.status
 
-    @wraps
     async def invoke(self, json_payload: Dict[str, Any]) -> str:
         if not self.available:
             return f"API is unavailable: {self.status}"
         async with aiohttp.ClientSession() as session:
             headers = {"Authorization": f"Api-Key {self.api_key}", "Content-Type": "application/json"}
-            async with session.post(self.url, headers=headers, json=json_payload) as resp:
+            async with session.post(self.url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
                 return result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "No data")
@@ -302,7 +291,7 @@ class NeuroSymbolicReasoner:
 
     def _extract_symbolic(self, text: str) -> float:
         x = symbols('x')
-        if "happy" in text.lower() or "happy" in text.lower():
+        if "happy" in text.lower():
             return float(simplify("x + 0.5").subs(x, 0))
         return 0.0
 
@@ -346,7 +335,7 @@ class YandexAIServices:
         self.sentiment_analyzer = SentimentAnalyzer()
         self.neuro_symbolic = NeuroSymbolicReasoner(self.sentiment_analyzer)
         self.quantum_optimizer = QuantumOptimizer()
-        self.loop = PriorityEventLoop()
+        self.loop = PriorityEventLoop().loop
         asyncio.set_event_loop(self.loop)
         self.metrics = {"requests": 0, "avg_response_time": 0.0}
         self.knowledge_experience = 0
